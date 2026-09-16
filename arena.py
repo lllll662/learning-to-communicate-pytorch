@@ -2,7 +2,6 @@ import copy
 
 import numpy as np
 import torch
-from torch.autograd import Variable
 
 from utils.dotdic import DotDic
 
@@ -172,9 +171,8 @@ class Arena:
 						else:
 							comm_target[:, agent_idx].zero_()
 
-					# comm_target.retain_grad()
 					agent_target_inputs = copy.copy(agent_inputs)
-					agent_target_inputs['messages'] = Variable(comm_target)
+					agent_target_inputs['messages'] = comm_target
 					agent_target_inputs['hidden'] = \
 						episode.step_records[step].hidden_target[agent_idx, :]
 					hidden_target_t, q_target_t = agent_target.model_target(**agent_target_inputs)

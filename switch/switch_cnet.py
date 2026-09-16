@@ -1,13 +1,12 @@
 """
 
-DRQN-based agent that learns to communicate with other agents to play 
+DRQN-based agent that learns to communicate with other agents to play
 the Switch game.
 
 """
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.autograd import Variable
 
 
 class SwitchCNet(nn.Module):
@@ -79,19 +78,19 @@ class SwitchCNet(nn.Module):
 	def forward(self, s_t, messages, hidden, prev_action, agent_index):
 		opt = self.opt
 
-		s_t = Variable(s_t)
-		hidden = Variable(hidden)
+		s_t = s_t
+		hidden = hidden
 		prev_message = None
 		if opt.model_dial:
 			if opt.model_action_aware:
-				prev_action = Variable(prev_action)
+				prev_action = prev_action
 		else:
 			if opt.model_action_aware:
 				prev_action, prev_message = prev_action
-				prev_action = Variable(prev_action)
-				prev_message = Variable(prev_message)
-			messages = Variable(messages)
-		agent_index = Variable(agent_index)
+				prev_action = prev_action
+				prev_message = prev_message
+			messages = messages
+		agent_index = agent_index
 
 		z_a, z_o, z_u, z_m = [0]*4
 		z_a = self.agent_lookup(agent_index)
