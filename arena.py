@@ -13,6 +13,15 @@ class Arena:
 		self.eps = opt.eps
 
 	def create_episode(self):
+		"""
+		episode 的数据结构：
+			episode = {
+				'steps': [bs],                    # 每个game走了多少步
+				'ended': [bs],                    # 哪些game已结束
+				'r': [bs, nagents],               # 各game的奖励
+				'step_records': []                # 每一步的详细记录
+			}
+		"""
 		opt = self.opt
 		episode = DotDic({})
 		episode.steps = torch.zeros(opt.bs).int()
@@ -23,6 +32,20 @@ class Arena:
 		return episode
 
 	def create_step_record(self):
+		"""
+		step_record 的数据结构：
+			record = {
+				's_t': [bs, nagents],             # 状态(每个agent是否在房间里)
+				'a_t': [bs, nagents],             # 各agent的动作
+				'comm': [bs, nagents, comm_bits], # 各agent的通信
+				'r_t': [bs, nagents],             # 各agent的奖励
+				'terminal': [bs],                 # 游戏是否结束
+				'hidden': [nagents, layers, bs, rnn_size]  # RNN隐状态
+				'q_a_t': [bs, nagents],           # 执行的动作Q值
+				'q_a_max_t': [bs, nagents],       # 最大动作Q值（用于学习）
+				...
+			}
+		"""
 		opt = self.opt
 		record = DotDic({})
 		record.s_t = None
@@ -62,12 +85,12 @@ class Arena:
 	def run_episode(self, agents, train_mode=False):
 		opt = self.opt
 		game = self.game
-		game.reset()
-		self.eps = self.eps * opt.eps_decay
+		game.reset()		# 重置游戏
+		self.eps = self.eps * opt.eps_decay		# 衰减探索率
 
 		step = 0
-		episode = self.create_episode()
-		s_t = game.get_state()
+		episode = self.create_episode()		# 创建episode记录	
+		s_t = game.get_state()				# 获取初始状态
 		episode.step_records.append(self.create_step_record())
 		episode.step_records[-1].s_t = s_t
 		episode_steps = train_mode and opt.nsteps + 1 or opt.nsteps
@@ -221,16 +244,20 @@ class Arena:
 		rewards = []
 		for e in range(opt.nepisodes):
 			# run episode
+			# 1. 训练阶段：agents探索和学习
 			episode = self.run_episode(agents, train_mode=True)
 			norm_r = self.average_reward(episode)
 			if verbose:
 				print('train epoch:', e, 'avg steps:', episode.steps.float().mean().item(), 'avg reward:', norm_r)
+
+			# 2. 每个agent从episode中学习
 			if opt.model_know_share:
-				agents[1].learn_from_episode(episode)
+				agents[1].learn_from_episode(episode)	# 共享参数
 			else:
 				for agent in agents[1:]:
-					agent.learn_from_episode(episode)
+					agent.learn_from_episode(episode)	# 独立学习
 
+			# 3. 定期测试：检查学到了什么
 			if e % opt.step_test == 0:
 				episode = self.run_episode(agents, train_mode=False)
 				norm_r = self.average_reward(episode)
