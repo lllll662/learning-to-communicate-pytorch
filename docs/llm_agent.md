@@ -97,11 +97,57 @@ CPU 上的前向是算力瓶颈（约 290 token/s），system prompt 约占每�
 灯 ON 且这是我第一次来 → 宣布；
 灯已经是 ON，或者今天不是第 1 天且昨天在房间的不是我 → 开灯；否则关灯。
 
-## 6. 后续计划
+## 6. LoRA + REINFORCE 微调（第二次改动）
 
-1. GPU 上换 Qwen2.5-1.5B / 3B，设 `"cuda": 1`，重新评估零样本和带提示两种配置。
-2. LoRA + REINFORCE（组内基线）：γ=1、奖励只在结尾，每局的最终奖励就是每一步的回报。
-   `LLMArena.train` 现在只做评估，需要实现 `train_mode=True` 时的采样、记录 prompt，
-   以及 `learn_from_episode`。注意 `option_logits` 目前带 `@torch.inference_mode()`，
-   训练时要另写一个有梯度的版本。
-3. 可选：先用训练好的 DIAL 策略生成轨迹，对 LLM 做 SFT 热启动。
+### 6.1 算法
+- **只训练 LoRA**：r=8，作用在 q/k/v/o 投影上，约 108 万参数（占 0.22%），原模型冻结。
+  3 个囚犯共用同一个 LoRA（参数共享），靠 prompt 里的编号区分身份。
+- **回报**：γ=1、奖励只在结尾，所以每局的团队奖励 R_b 就是这局每个决策的回报。
+- **优势**：A_b = R_b − mean(R)，组内基线，bs 就是组的大小。优势为 0 的决策直接跳过，不做前向。
+- **loss** = −Σ A_b · log π_mix(a|prompt) / 这个 episode 的决策总数；梯度裁剪 1.0，优化器 AdamW。
+- 训练循环：每个 episode 先采样 → 更新一次；每 `step_test` 轮用贪心策略评估一次并写入 CSV。
+  结束时把 LoRA adapter 保存到 `llm_save_path`。
+
+### 6.2 冷启动与探索（为什么有 ε）
+零样本时 P(C) 约 0.1%，几乎从不宣布 → 所有局 R=0 → 优势全是 0 → 没有梯度。
+所以采样用混合策略 **π_mix = (1−ε)·softmax(logits/T) + ε/3**：
+有 ε 的概率在 A/B/C 中均匀选，保证宣布会发生，从而产生输赢信号。
+**采样和算 log π 都用 π_mix**，这样策略梯度对 π_mix 是无偏的，不需要做重要性采样修正。
+评估时用 logits 的 argmax（贪心），不含 ε。
+没有采用 SFT 热启动，是为了不把人为设计的协议灌进模型（研究的是通信能否自己涌现）。
+如果 RL 学不动，SFT 热启动是备选方案。
+
+### 6.3 带梯度前向与 KV cache
+- **推理**（`option_logits`）：system prompt 的 KV 只算一次并缓存，每个 chunk deepcopy 后使用。
+- **训练**（`learn_from_episode`）：每个 chunk 用 batch=1 **带梯度地重算一次**前缀，再
+  `batch_repeat_interleave` 扩成 batch。LoRA 也作用在 system prompt 上，梯度要能传回前缀。
+  带梯度的张量不能 deepcopy，所以训练时不复用推理的缓存。
+- **每次 `optimizer.step()` 之后必须把 `prefix_text` 置为 None**，否则推理还在用旧参数算出的 KV。
+- 前向和反向逐 chunk 进行（`llm_forward_bs`）、梯度累加，以控制显存和内存。
+
+### 6.4 验证
+- 训练路径（共享前缀 + 右填充 + 分 chunk 反向）的 LoRA 梯度，和"逐条完整 prompt、不 padding、
+  不用 cache"的基准对比：相对误差 7.8e-5；loss 前 5 位有效数字一致。
+  验证前先把 lora_B 设成随机值，否则初始 B=0 时 A 的梯度恒为 0，对比没有意义。
+- 一次 `learn_from_episode` 之后：前缀缓存已失效，推理结果和基准的误差为 1.1e-5。
+- **以后改 `_suffix_logits` / `learn_from_episode` 时，重做这两项对比。**
+
+### 6.5 配置
+| 配置 | 用途 |
+|---|---|
+| `switch_3_llm_rl.json` | 正式训练，bs=32、1001 个 episode、`cuda: 1`（没有 GPU 时自动回落到 CPU） |
+| `switch_3_llm_rl_quick.json` | CPU 上验证流程，bs=8、3 个 episode |
+
+新增配置项：`llm_train`、`llm_lora_r`、`llm_save_path`、`llm_lora_path`（加载已训练的 adapter，
+可以配合 `llm_train: false` 做纯评估）。另外复用了原有的 `eps`、`learningrate`、`step_test`。
+
+### 6.6 预期与监控
+- 参照线："只在第 6 天宣布"不需要通信，归一化 reward 约为 0.65；oracle 协议为 1.0。
+  如果曲线卡在 0.65 附近，说明模型学会了看日期，但没学会用灯。
+- 训练日志（`-v`）里：lose 高 → 乱宣布；tell rate 趋近 0 → 缩回"永远不说"的状态。
+
+## 7. 后续计划
+
+1. GPU 上正式跑 `switch_3_llm_rl.json`，并和 RIAL/DIAL 的曲线对比。
+2. 通信消融：无通信（灯恒定、prompt 中不提灯）、信道噪声、更大的模型。
+3. 如果 RL 冷启动过不去：用 oracle 或 DIAL 的轨迹做 SFT 热启动。

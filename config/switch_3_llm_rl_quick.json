@@ -1,0 +1,21 @@
+{
+   "game":"switch",
+   "agent_type":"llm",
+   "llm_model_path":"models/Qwen2.5-0.5B-Instruct",
+   "llm_train":true,
+   "llm_lora_r":8,
+   "llm_temperature":1.0,
+   "llm_forward_bs":16,
+   "llm_save_path":"results/lora_switch_3_rl_quick",
+   "eps":0.2,
+   "learningrate":0.0001,
+   "game_nagents":3,
+   "game_action_space":2,
+   "game_comm_limited":true,
+   "game_comm_bits":1,
+   "model_dial":false,
+   "bs":8,
+   "nepisodes":3,
+   "step_test":2,
+   "cuda":0
+}

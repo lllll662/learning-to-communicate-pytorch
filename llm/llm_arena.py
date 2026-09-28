@@ -5,7 +5,8 @@
 	- 没有 RNN 隐状态 / target 网络 / ε-greedy，agent 的记忆由每局的 history 显式记录并写进 prompt
 	- 不在房间的 agent 只能选 NOTHING，所以每一步只需要为当前 active 的 agent 调用一次 LLM，
 	  bs 局游戏的 prompt 拼成一个 batch 一起前向
-	- 目前只做推理（演示阶段），train() 里每个 episode 都是评估，不更新 LLM 参数
+	- llm_train=false：train() 里每个 episode 都是贪心评估，不更新 LLM 参数
+	- llm_train=true：每个 episode 先采样一批游戏、用 REINFORCE 更新 LoRA，每 step_test 轮贪心评估一次
 """
 import torch
 
@@ -27,6 +28,7 @@ class LLMArena(Arena):
 		episode = self.create_episode()
 		episode.tell = torch.zeros(opt.bs).int()	# 这局是否有人 TELL
 		episode.transcripts = [[] for _ in range(opt.bs)]
+		episode.decisions = []		# 训练用：每个 LLM 决策 (b, messages, option)
 
 		bulb = torch.zeros(opt.bs, dtype=torch.long)	# 第 1 天灯是 OFF
 		# history[b][agent_idx]: 这个 agent 在第 b 局的访问记录 [(day, 看到的bit, option), ...]
@@ -50,7 +52,8 @@ class LLMArena(Arena):
 
 			# 3. 选项 → 游戏动作 + 灯泡 bit（不在房间的 agent 默认 NOTHING）
 			a_t = torch.full((opt.bs, opt.game_nagents), game.game_actions.NOTHING, dtype=torch.long)
-			for b, a, option in zip(live, active, options.tolist()):
+			for b, a, m, option in zip(live, active, messages, options.tolist()):
+				episode.decisions.append((b, m, option))
 				history[b][a - 1].append((step + 1, bulb[b].item(), option))
 				episode.transcripts[b].append((step + 1, a, bulb[b].item(), option))
 				if option == pb.OPTION_TELL:
@@ -80,23 +83,38 @@ class LLMArena(Arena):
 		for day, a, seen, option in episode.transcripts[b]:
 			print(f'    day {day}: prisoner {a} saw bulb {pb.bulb_str(seen)} -> {pb.describe_option(option)}')
 
+	def episode_stats(self, episode):
+		team_r = episode.r[:, 0]
+		return (f'avg steps: {episode.steps.float().mean().item():.2f} '
+			f'avg reward: {self.average_reward(episode):.3f} '
+			f'| tell rate: {episode.tell.float().mean().item():.3f} '
+			f'win: {(team_r > 0).float().mean().item():.3f} '
+			f'lose: {(team_r < 0).float().mean().item():.3f}')
+
 	def train(self, policy, reset=True, verbose=False, test_callback=None):
 		opt = self.opt
 		rewards = []
 		for e in range(opt.nepisodes):
-			episode = self.run_episode(policy, train_mode=False)
-			norm_r = self.average_reward(episode)
-			rewards.append(norm_r)
-			if test_callback:
-				test_callback(e, norm_r)
+			# 1. 训练：按 π_mix 采样一批游戏，REINFORCE 更新 LoRA
+			if opt.llm_train:
+				episode = self.run_episode(policy, train_mode=True)
+				loss = policy.learn_from_episode(episode)
+				if verbose:
+					print('train epoch:', e, self.episode_stats(episode), f'loss: {loss:.4f}')
 
-			team_r = episode.r[:, 0]
-			print('TEST EPOCH:', e, 'avg steps:', episode.steps.float().mean().item(), 'avg reward:', norm_r,
-				'| tell rate:', episode.tell.float().mean().item(),
-				'win:', (team_r > 0).float().mean().item(),
-				'lose:', (team_r < 0).float().mean().item())
-			if verbose:
-				self.describe_episode(episode)
+			# 2. 测试：贪心策略评估（不训练时每个 episode 都评估）
+			if not opt.llm_train or e % opt.step_test == 0:
+				episode = self.run_episode(policy, train_mode=False)
+				norm_r = self.average_reward(episode)
+				rewards.append(norm_r)
+				if test_callback:
+					test_callback(e, norm_r)
+				print('TEST EPOCH:', e, self.episode_stats(episode))
+				if verbose:
+					self.describe_episode(episode)
 
-		print('MEAN REWARD over', opt.nepisodes, 'episodes:', sum(rewards) / len(rewards))
+		print('MEAN TEST REWARD over', len(rewards), 'evaluations:', sum(rewards) / len(rewards))
+		if opt.llm_train and opt.llm_save_path:
+			policy.save(opt.llm_save_path)
+			print('LoRA adapter saved to', opt.llm_save_path)
 		return rewards
