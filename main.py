@@ -84,8 +84,15 @@ def run_trial(opt, result_path=None, verbose=False):
 	opt = init_opt(opt)
 
 	game = create_game(opt)       		# 创建Switch游戏
-	agents = create_agents(opt, game)   # 创建N个智能体
-	arena = Arena(opt, game)        	# 创建训练竞技场
+	if opt.agent_type == 'llm':
+		# LLM agent：延迟导入，DQN 环境里没装 transformers 也能正常跑
+		from llm.llm_agent import LLMPolicy
+		from llm.llm_arena import LLMArena
+		agents = LLMPolicy(opt)       	# 所有agent共享一个LLM
+		arena = LLMArena(opt, game)
+	else:
+		agents = create_agents(opt, game)   # 创建N个智能体
+		arena = Arena(opt, game)        	# 创建训练竞技场
 
 
 	test_callback = None

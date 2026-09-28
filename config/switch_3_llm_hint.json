@@ -1,0 +1,16 @@
+{
+   "game":"switch",
+   "agent_type":"llm",
+   "llm_model_path":"models/Qwen2.5-0.5B-Instruct",
+   "llm_temperature":1.0,
+   "llm_forward_bs":16,
+   "llm_strategy_hint":"Treat bulb ON as meaning 'at least two different prisoners have already visited'. If the bulb is ON and this is your first visit, announce (option C). Otherwise, leave the bulb ON (option B) if it was already ON or if you were not the prisoner in the room yesterday; on day 1, or if you were also in the room yesterday and the bulb is OFF, leave it OFF (option A).",
+   "game_nagents":3,
+   "game_action_space":2,
+   "game_comm_limited":true,
+   "game_comm_bits":1,
+   "model_dial":false,
+   "bs":16,
+   "nepisodes":5,
+   "cuda":0
+}

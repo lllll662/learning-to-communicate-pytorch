@@ -1,0 +1,15 @@
+{
+   "game":"switch",
+   "agent_type":"llm",
+   "llm_model_path":"models/Qwen2.5-0.5B-Instruct",
+   "llm_temperature":1.0,
+   "llm_forward_bs":16,
+   "game_nagents":3,
+   "game_action_space":2,
+   "game_comm_limited":true,
+   "game_comm_bits":1,
+   "model_dial":false,
+   "bs":16,
+   "nepisodes":5,
+   "cuda":0
+}

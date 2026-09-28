@@ -1,0 +1,13 @@
+# LLM agent 环境（conda env: llm_cpu）
+#   conda create -n llm_cpu python=3.10 -y --override-channels -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+#   pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements_llm.txt
+#   modelscope download --model Qwen/Qwen2.5-0.5B-Instruct --local_dir models/Qwen2.5-0.5B-Instruct
+# GPU 上把 torch 换成对应 CUDA 版本，例如 pip install torch --index-url https://download.pytorch.org/whl/cu124
+torch==2.14.0
+transformers==5.17.0
+accelerate==1.15.0
+peft==0.21.0
+modelscope==1.40.1
+numpy==2.2.6
+pandas==2.3.3
+matplotlib==3.10.9
