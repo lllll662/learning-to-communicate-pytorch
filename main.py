@@ -138,5 +138,8 @@ if __name__ == '__main__':
 		if result_path:
 			trial_result_path = result_path + '_' + str(i + args.start_index) + '.csv'
 		trial_opt = copy.deepcopy(opt)
+		if trial_opt.llm_save_path:
+			# 每个 trial 用自己的 LoRA / checkpoint 目录，和结果 CSV 的编号一致，避免互相"续训"
+			trial_opt.llm_save_path = trial_opt.llm_save_path + '_' + str(i + args.start_index)
 		run_trial(trial_opt, result_path=trial_result_path, verbose=args.verbose)
 

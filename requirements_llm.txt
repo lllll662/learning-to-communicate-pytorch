@@ -3,6 +3,9 @@
 #   pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements_llm.txt
 #   modelscope download --model Qwen/Qwen2.5-0.5B-Instruct --local_dir models/Qwen2.5-0.5B-Instruct
 # GPU 上把 torch 换成对应 CUDA 版本，例如 pip install torch --index-url https://download.pytorch.org/whl/cu124
+# GPU（Linux）上 torch 会调用 Triton，Triton 需要 C 编译器；机器上没有 gcc 时：
+#   conda install -y --override-channels -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge gcc
+#   export CC=$(which gcc)
 torch==2.14.0
 transformers==5.17.0
 accelerate==1.15.0

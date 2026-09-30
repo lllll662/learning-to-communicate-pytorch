@@ -165,5 +165,21 @@ class LLMPolicy:
 		self.prefix_text = None
 		return total_loss
 
+	def state_dict(self):
+		"""断点续训用：LoRA 参数 + 优化器状态（原模型冻结，不需要保存）"""
+		return {
+			'lora': {n: p.detach().cpu() for n, p in self.model.named_parameters() if p.requires_grad},
+			'optimizer': self.optimizer.state_dict(),
+		}
+
+	def load_state_dict(self, state):
+		params = {n: p for n, p in self.model.named_parameters() if p.requires_grad}
+		assert params.keys() == state['lora'].keys(), 'checkpoint LoRA does not match the current model'
+		with torch.no_grad():
+			for n, p in params.items():
+				p.copy_(state['lora'][n])
+		self.optimizer.load_state_dict(state['optimizer'])	# 会自动把状态搬到参数所在的设备
+		self.prefix_text = None		# 参数变了，system prompt 的 KV cache 失效
+
 	def save(self, path):
 		self.peft_model.save_pretrained(path)

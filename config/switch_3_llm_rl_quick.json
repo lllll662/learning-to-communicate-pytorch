@@ -16,6 +16,7 @@
    "model_dial":false,
    "bs":8,
    "nepisodes":3,
+   "llm_ckpt_every":1,
    "step_test":2,
    "cuda":0
 }

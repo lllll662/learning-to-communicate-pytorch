@@ -76,6 +76,11 @@ CPU 上的前向是算力瓶颈（约 290 token/s），system prompt 约占每�
    `main.py` 里 LLM 相关的 import 是延迟的，别挪到文件顶部，否则 DQN 在旧环境里会跑不起来。
 5. `LLMArena.run_episode` 没有调用 `Arena.create_step_record`：它会建 RNN hidden 张量，
    依赖 `model_rnn_size` 等 DQN 配置项，LLM 配置里没有这些字段。
+6. **Linux GPU 上报 `RuntimeError: Failed to find C compiler`**（2026-09-30，在 GPU 服务器上第一次正式训练时遇到）：
+   torch 2.14 在 GPU 上的部分算子（比如 RoPE 里的矩阵乘）走 Triton，Triton 第一次启动时要用 gcc
+   编译一个辅助模块，精简容器里通常没有 gcc。解决办法：把 gcc 装到 conda 环境里（命令见 `requirements_llm.txt`），
+   再 `export CC=$(which gcc)`。如果之后又报 `cannot find -lcuda`，就把 `TRITON_LIBCUDA_PATH` 设成 libcuda.so 所在的目录。
+   装好后，1001 个 episode 大约 35–40 分钟（每个 episode 约 2 秒）。
 
 ## 5. 验证情况和结果
 
@@ -139,12 +144,70 @@ CPU 上的前向是算力瓶颈（约 290 token/s），system prompt 约占每�
 | `switch_3_llm_rl_quick.json` | CPU 上验证流程，bs=8、3 个 episode |
 
 新增配置项：`llm_train`、`llm_lora_r`、`llm_save_path`、`llm_lora_path`（加载已训练的 adapter，
-可以配合 `llm_train: false` 做纯评估）。另外复用了原有的 `eps`、`learningrate`、`step_test`。
+可以配合 `llm_train: false` 做纯评估）、`llm_ckpt_every`、`llm_resume`（见 6.7）。另外复用了原有的 `eps`、`learningrate`、`step_test`。
 
 ### 6.6 预期与监控
 - 参照线："只在第 6 天宣布"不需要通信，归一化 reward 约为 0.65；oracle 协议为 1.0。
   如果曲线卡在 0.65 附近，说明模型学会了看日期，但没学会用灯。
 - 训练日志（`-v`）里：lose 高 → 乱宣布；tell rate 趋近 0 → 缩回"永远不说"的状态。
+
+### 6.7 断点续训与时间记录（第三次改动，2026-09-30）
+GPU 正式训练要跑上千个 episode，为了防止中途被打断后从头再来，加了自动保存和续训。
+
+**保存目录**（`main.py` 会给 `llm_save_path` 加上 trial 编号，和结果 CSV 一致，例如 `results/lora_switch_3_rl_0/`）：
+
+| 文件 | 内容 | 何时写 |
+|---|---|---|
+| `checkpoint.pt` | LoRA 参数、AdamW 状态、已完成的 episode、测试结果列表、累计用时、torch / CUDA / numpy / random 的随机数状态、配置 | 每 `llm_ckpt_every` 个 episode（默认 = `step_test`），以及最后一个 episode |
+| `train_log.csv` | 每个 episode 的 train / test 指标（reward、tell rate、win、lose、loss）、累计用时 `elapsed_s`、时间戳 | 每个 episode |
+| `adapter_*.safetensors` 等 | 最终的 LoRA adapter，可用 `llm_lora_path` 加载 | 训练结束时 |
+
+**续训**：用同样的命令重新运行即可。启动时发现 `checkpoint.pt` 就从下一个 episode 接着训，并且：
+- 结果 CSV（`-r` 指定的）会被 `main.py` 以 `'w'` 打开，所以 `train()` 会把 checkpoint 里的测试结果先补写回去；
+- `train_log.csv` 里 checkpoint 之后的行会被丢掉（这些 episode 会重新训练）；
+- 随机数状态也恢复了，所以"中断 + 续训"和"一口气跑完"的结果完全一样（CPU 上验证过，见下）；
+- 累计用时不包含中断的那段时间；ETA 按本次运行的平均速度估算。
+
+**注意事项**：
+- 想重新开始一次训练：换一个 `llm_save_path`、删掉 `checkpoint.pt`，或者设 `"llm_resume": false`。
+  否则会**自动续训**，可能接上上一次的实验。续训时如果配置和 checkpoint 不一致（`nepisodes`、`step_test`、
+  `llm_ckpt_every`、`llm_resume` 除外），会打印 `WARNING: config differs from checkpoint`。
+- 想在训完后多训一段：把 `nepisodes` 改大，再运行。
+- 最多损失 `llm_ckpt_every` 个 episode 的进度。checkpoint 约 13MB（LoRA 加上 Adam 的两份状态），
+  保存时先写 `.tmp` 再替换，保存到一半被打断也不会损坏上一个 checkpoint。
+- 没有捕获 Ctrl+C 做额外保存：中断时参数可能正在更新到一半，状态不一致，所以只依赖定期保存。
+
+**验证**：用快速配置和固定 seed 做了对比：
+- A：一口气跑 3 个 episode；
+- B：先跑 2 个，再换一个 seed 续训第 3 个；续训前还往 `train_log.csv` 里写了一行假数据。
+
+结果：两者最终的 LoRA 参数、测试结果和 CSV 完全一致，假数据行也被正确去掉。
+**以后改训练循环或 checkpoint 内容时，重做这个对比。**
+
+### 6.8 训练曲线可视化（2026-09-30）
+`llm/plot_training.py` 读取 `train_log.csv` 画 PNG，只依赖 matplotlib / numpy，不加载模型。
+- **自动**：`train()` 结束、保存 adapter 之后调用 `plot_run`，生成 `llm_save_path/training_curves.png`。
+  画图出错只打印 WARNING，不影响训练结果。
+- **手动**（训练中途也可以，`train_log.csv` 每个 episode 都会刷新）：
+  ```
+  python -m llm.plot_training results/lora_switch_3_rl_0
+  ```
+- **多次训练对比**（比如通信消融），每次训练一条测试奖励曲线：
+  ```
+  python -m llm.plot_training results/comm_0 results/nocomm_0 -l comm no-comm -o results/compare.png
+  ```
+
+`training_curves.png` 的内容：
+| 面板 | 内容 |
+|---|---|
+| 标题 | episode 数、累计训练用时、每个 episode 的平均用时、最好 / 最后一次测试奖励 |
+| 上 | 归一化奖励：测试（贪心）和训练采样（含 ε，EWMA 平滑）；虚线参照 1.0（oracle）和不通信基线（3 人时为 0.65，按 `nagents` / `nsteps` 计算） |
+| 左下 | 测试时的 win / lose / announce 比例，用于判断是乱宣布还是不敢宣布（见 6.6） |
+| 右下 | REINFORCE loss（原始值 + EWMA）。组内基线下 loss 的绝对值没有意义，只用来看是否发散 |
+
+注意：
+- 训练曲线含 ε 探索，比测试低很多是正常的，**以测试曲线为准**。
+- 用 `Figure` 对象直接存图，不依赖显示器，服务器上也能跑；图里的文字用英文，避免服务器缺中文字体时显示方块。
 
 ## 7. 后续计划
 
