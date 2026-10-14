@@ -90,6 +90,12 @@ def run_trial(opt, result_path=None, verbose=False):
 		from llm.llm_arena import LLMArena
 		agents = LLMPolicy(opt)       	# 所有agent共享一个LLM
 		arena = LLMArena(opt, game)
+	elif opt.agent_type == 'icl':
+		# 上下文学习：每个 agent 一个独立的 LLM 实例，不训练参数
+		from icl.backend import make_backends
+		from icl.icl_arena import ICLArena
+		agents = make_backends(opt)		# [None, agent1 的后端, ...]
+		arena = ICLArena(opt, game)
 	else:
 		agents = create_agents(opt, game)   # 创建N个智能体
 		arena = Arena(opt, game)        	# 创建训练竞技场
@@ -141,5 +147,7 @@ if __name__ == '__main__':
 		if trial_opt.llm_save_path:
 			# 每个 trial 用自己的 LoRA / checkpoint 目录，和结果 CSV 的编号一致，避免互相"续训"
 			trial_opt.llm_save_path = trial_opt.llm_save_path + '_' + str(i + args.start_index)
+		if trial_opt.icl_run_dir:
+			trial_opt.icl_run_dir = trial_opt.icl_run_dir + '_' + str(i + args.start_index)
 		run_trial(trial_opt, result_path=trial_result_path, verbose=args.verbose)
 

@@ -1,0 +1,30 @@
+{
+   "game": "switch",
+   "agent_type": "icl",
+   "game_nagents": 3,
+   "game_action_space": 2,
+   "game_comm_limited": true,
+   "game_comm_bits": 1,
+   "model_dial": false,
+   "icl_backend": "hf",
+   "icl_agents": [
+      {
+         "model_path": "models/Qwen2.5-0.5B-Instruct"
+      },
+      {
+         "model_path": "models/Qwen2.5-0.5B-Instruct"
+      },
+      {
+         "model_path": "models/Qwen2.5-0.5B-Instruct"
+      }
+   ],
+   "icl_run_dir": "results/icl_hf_smoke",
+   "icl_reflect": true,
+   "icl_plan_turns": 1,
+   "icl_rounds": 2,
+   "icl_max_tokens": 160,
+   "icl_plan_max_tokens": 200,
+   "icl_seed": 0,
+   "bs": 2,
+   "cuda": 0
+}

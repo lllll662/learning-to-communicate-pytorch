@@ -1,0 +1,34 @@
+{
+   "game": "switch",
+   "agent_type": "icl",
+   "game_nagents": 3,
+   "game_action_space": 2,
+   "game_comm_limited": true,
+   "game_comm_bits": 1,
+   "model_dial": false,
+   "icl_backend": "vllm",
+   "icl_agents": [
+      {
+         "url": "http://localhost:8001/v1",
+         "model": "agent1"
+      },
+      {
+         "url": "http://localhost:8002/v1",
+         "model": "agent2"
+      },
+      {
+         "url": "http://localhost:8003/v1",
+         "model": "agent3"
+      }
+   ],
+   "icl_run_dir": "results/icl_plan",
+   "icl_reflect": false,
+   "icl_plan_turns": 2,
+   "icl_rounds": 4,
+   "icl_temperature": 0.0,
+   "icl_max_tokens": 512,
+   "icl_plan_temperature": 0.7,
+   "icl_plan_max_tokens": 768,
+   "icl_seed": 0,
+   "bs": 32
+}

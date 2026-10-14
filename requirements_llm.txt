@@ -6,6 +6,12 @@
 # GPU（Linux）上 torch 会调用 Triton，Triton 需要 C 编译器；机器上没有 gcc 时：
 #   conda install -y --override-channels -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge gcc
 #   export CC=$(which gcc)
+# 上下文学习实验（icl/，icl_backend=vllm）：客户端只用标准库，不需要额外的包；
+# vLLM 服务单独建环境，因为 vllm 会装它自己需要的 torch 版本，混装会弄坏上面的环境：
+#   conda create -n llm_vllm python=3.10 -y --override-channels -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+#   conda activate llm_vllm && pip install -i https://pypi.tuna.tsinghua.edu.cn/simple vllm modelscope
+#   modelscope download --model Qwen/Qwen2.5-3B-Instruct --local_dir models/Qwen2.5-3B-Instruct
+#   bash icl/launch_vllm.sh models/Qwen2.5-3B-Instruct
 torch==2.14.0
 transformers==5.17.0
 accelerate==1.15.0
