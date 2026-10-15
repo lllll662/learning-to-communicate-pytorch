@@ -66,6 +66,7 @@
 - `icl_temperature`（比赛中，默认 0）、`icl_max_tokens`、`icl_plan_temperature`（比赛外，默认 0.7）、`icl_plan_max_tokens`；
 - `icl_request_extra`（原样并入 vLLM 请求，比如 Qwen3 关闭思考模式：`{"chat_template_kwargs": {"enable_thinking": false}}`）、`icl_concurrency`、`icl_timeout`；
 - `icl_run_dir`、`icl_seed`、`icl_resume`。
+- 第二次改动新增的配置项（见第 7 节）：`icl_prefill`、`icl_notes`、`icl_check_protocol`、`icl_check_min`、`icl_check_retries`、`icl_hf_batch`。
 
 `bs` 是每轮并行的局数。`nepisodes` / `step_test` 在 ICL 里不用。
 
@@ -80,7 +81,8 @@ conda activate llm_gpu        # 客户端在哪个环境都行，只用标准库
 python -u main.py -c config/switch_3_icl_given.json -r results -v    # E1
 python -u main.py -c config/switch_3_icl_plan.json -r results        # E2
 python -u main.py -c config/switch_3_icl_reflect.json -r results     # E3
-python -m llm.plot_training results/icl_reflect_0                   # 画曲线（横轴 episode 就是轮次）
+python -m icl.plot_icl results/icl_reflect_0                        # 重画曲线（训练结束时会自动画）
+python -m icl.diagnose results/icl_given_0                          # 按规则的正确率 + 宣布分析
 ```
 
 被打断后用同样的命令重新运行，会从下一轮接着跑。想从头开始：换 `icl_run_dir`、删掉 `state.json`，或者设 `"icl_resume": false`。
@@ -103,4 +105,55 @@ python -m llm.plot_training results/icl_reflect_0                   # 画曲线�
 - 自由生成比"首 token 打分"慢得多，CPU 上只适合冒烟测试。
 - 1 号兼任书记员，所以协议的措辞会偏向 1 号。如果之后要研究"谁主导协议"，可以轮换书记员。
 - 复盘给的是上帝视角（谁哪天来过），这是比赛外的信息，不会进入比赛中的 prompt。
-- `plot_training` 的横轴标签写的是 episode，ICL 里表示的是轮次；loss 面板是空的。
+- `train_log.csv` 仍然沿用 `llm_arena` 的格式，可以用 `llm.plot_training` 画；但 ICL 的指标以 `icl_metrics.csv` 和 `icl_curves.png` 为准。
+
+## 7. Qwen2.5-3B 第一次结果和第二次改动（2026-10-15）
+
+**结果**（`results_icl/`，hf 后端，每轮 32 局；分析方法见 `icl/diagnose.py`）：
+- **E1 = 0**：从不宣布。R1（灯 ON 且第一次来 → 宣布）0/122，推理里一次都没提到 announce。
+  另外有这些问题：
+  - R3 正确率 0.46；
+  - R4 有 35% 误开灯；
+  - 30% 的输出先给 JSON 再补推理；
+  - 34% 的笔记照抄了模板里的占位文字。
+- **E2**：商定的协议没定义宣布条件，用的是"之前每天都在房间"这类不可能成立的条件。第 2 天宣布了 8 次，全输。
+- **E3**：协议同样没有逻辑，宣布条件依赖从未定义的 "prediction"。分数偶尔上升，原因是：
+  - 宣布主要发生在"第一次来、第 3 天以后、灯 OFF"的局面，靠的是自己的访问记录，不是灯泡；
+  - 理论上"第一次来且第 3 天以后就宣布"的分数是 0.28，和最高的一轮（0.29）一致；
+  - 剩下的起伏都在每轮 32 局的噪声范围内（标准差约 0.2）。
+
+**改动**：
+
+| 问题 | 改动 |
+|---|---|
+| 先答后想、跳过规则 1、读错"是不是第一次来" | 决策 prompt 把事实逐条写明（灯、是否第一次来及来过哪几天、昨天在不在）。回复格式固定为 `FACTS → RULE → CHECK（前面的规则为什么不适用）→ JSON`，并在 assistant 回复开头**预填** `FACTS:`（vLLM 用 `continue_final_message`，hf 用 `apply_chat_template(continue_final_message=True)`），保证先推理后作答。`icl_prefill: false` 可关闭 |
+| 照抄模板占位文字 | 占位文字改成 `<...>` 的形式；解析时识别出照抄就当作空笔记 |
+| 自写笔记可能误导 | `icl_notes: false`：消融，只保留程序记录的客观访问历史 |
+| 每轮 32 局噪声太大 | E1/E2/E3 配置改为 `bs: 128`；每轮记录 reward 的 bootstrap 标准误 |
+| 只看 reward 看不出原因 | 每轮写 `icl_metrics.csv`，并画 `icl_curves.png`：和最优协议的一致率（按 R1–R4）、宣布次数 / 胜率 / 宣布时灯是 ON 的比例、协议检查的结果 |
+| 商定出的协议没有逻辑 | **协议检查**（`icl/protocol_check.py`，见下） |
+
+**协议检查**：
+1. 每个 agent 用自己的模型，把协议"编译"成一张决策表：29 种局面 →（第几天, 看到的灯, 是否第一次来, 昨天是不是自己）→ 动作。prompt 用 `build_compile_messages`，格式和比赛中的决策一样，只是没有访问记录和笔记。
+2. 穷举 3⁶ = 729 种来访顺序，算出"所有人都按自己的表完美执行时"的归一化 reward，同时记录：
+   - 会在哪些局面说错；
+   - 动作是否依赖灯泡（不依赖就说明灯泡不携带信息）；
+   - 各 agent 的表有多少局面不一致（协议有歧义）。
+3. `icl_check_protocol`：
+   - `"report"`：只记录（E1 用。人写的协议不修改，这时它衡量的是模型对协议的理解）；
+   - `"revise"`：完美执行分数低于 `icl_check_min`（默认 0.65，即不通信也能拿到的分数）时，把检查报告交给 1 号修改，最多 `icl_check_retries`（默认 2）次，用分数最高的一版（E2 / E3 用）。
+4. 输出 `round_xx/protocol_check*.md`、`protocol_table*.json`、`protocol_v*.md`。
+
+解读：
+- "协议完美执行的分数"和"实际分数"之差，就是执行上的损失；
+- 协议分数本身低，说明设计有问题。
+
+**注意**：
+- `revise` 等于给了 agent 一个"能推演协议的工具"。如果要研究纯粹的自主设计，就用 `report` 跑一组对照。
+- 检查报告里只说分数和出错的局面，不提示具体策略。
+- 编译只覆盖依赖这 4 个特征的协议；依赖笔记里的计数等更复杂状态的协议，只能近似。
+
+**验证**（CPU）：
+- `rule` 配置仍为 1.0，协议检查 1.0，R1–R4 全部 1.0；
+- 用模拟后端先给一份坏协议（"第一次来且第 3 天以后宣布"）：检查得 0.28（理论值 0.278），报告指出灯泡没用到、第 3 天说错率 50%；改写后的协议得 1.0 并被采用；
+- `evaluate` 算出的分数和理论值一致："只在第 6 天宣布" 0.65、oracle 1.0。

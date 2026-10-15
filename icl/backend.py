@@ -35,6 +35,8 @@ class VLLMBackend:
 	def _post(self, messages, temperature, max_tokens):
 		payload = dict(self.extra, model=self.model, messages=messages,
 			temperature=temperature, max_tokens=max_tokens)
+		if messages[-1]['role'] == 'assistant':		# 预填了回复开头：接着它往下生成，而不是另起一条回复
+			payload.update(add_generation_prompt=False, continue_final_message=True)
 		data = json.dumps(payload).encode()
 		for attempt in range(4):
 			try:
@@ -67,16 +69,25 @@ class HFBackend:
 		self.tokenizer.padding_side = 'left'		# 生成时左填充，新 token 接在每行末尾
 		dtype = torch.bfloat16 if self.device == 'cuda' else torch.float32
 		self.model = AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype).to(self.device).eval()
+		self.chunk = opt.icl_hf_batch or 16		# 每次 generate 的条数，显存不够时调小
+
+	def _prompt(self, messages):
+		cont = messages[-1]['role'] == 'assistant'		# 预填了回复开头：接着它往下生成
+		return self.tokenizer.apply_chat_template(messages, tokenize=False,
+			add_generation_prompt=not cont, continue_final_message=cont)
 
 	def chat(self, requests, temperature, max_tokens):
-		texts = [self.tokenizer.apply_chat_template(r['messages'], tokenize=False, add_generation_prompt=True)
-			for r in requests]
-		inputs = self.tokenizer(texts, return_tensors='pt', padding=True, add_special_tokens=False).to(self.device)
+		texts = [self._prompt(r['messages']) for r in requests]
 		kw = dict(do_sample=True, temperature=temperature) if temperature > 0 else dict(do_sample=False)
-		with self.torch.inference_mode():
-			out = self.model.generate(**inputs, max_new_tokens=max_tokens,
-				pad_token_id=self.tokenizer.pad_token_id, **kw)
-		return self.tokenizer.batch_decode(out[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
+		replies = []
+		for i in range(0, len(texts), self.chunk):
+			inputs = self.tokenizer(texts[i:i + self.chunk], return_tensors='pt', padding=True,
+				add_special_tokens=False).to(self.device)
+			with self.torch.inference_mode():
+				out = self.model.generate(**inputs, max_new_tokens=max_tokens,
+					pad_token_id=self.tokenizer.pad_token_id, **kw)
+			replies += self.tokenizer.batch_decode(out[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
+		return replies
 
 
 class RuleBackend:
@@ -90,12 +101,18 @@ class RuleBackend:
 
 	def _answer(self, meta):
 		phase = meta['phase']
-		if phase == 'decide':
+		if phase in ('decide', 'compile'):
+			if phase == 'compile':		# 抽象局面：构造一段和它一致的访问记录
+				from icl.protocol_check import situation_facts
+				meta = dict(meta, facts=situation_facts(meta))
 			option = oracle_option(meta['day'], meta['bulb'], meta['facts'])
 			action = {v: k for k, v in ACTIONS.items()}[option]
-			notes = f"I have visited {len(meta['facts']) + 1} time(s); last time I chose {action}."
-			return f"Applying the protocol.\n{json.dumps({'action': action, 'memory': notes})}"
-		if phase == 'draft':
+			out = {'action': action}
+			if phase == 'decide':
+				out['memory'] = f"I have visited {len(meta['facts']) + 1} time(s); last time I chose {action}."
+			# 和真模型一样，接在预填的 "FACTS:" 后面
+			return f" (as given)\nRULE: oracle rule\nCHECK: earlier rules do not apply\n{json.dumps(out)}"
+		if phase in ('draft', 'fix'):
 			return self.protocol
 		if phase == 'review':
 			return 'AGREE'

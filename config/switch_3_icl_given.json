@@ -28,5 +28,8 @@
    "icl_temperature": 0.0,
    "icl_max_tokens": 512,
    "icl_seed": 0,
-   "bs": 32
+   "bs": 128,
+   "icl_check_protocol": "report",
+   "icl_prefill": true,
+   "icl_notes": true
 }

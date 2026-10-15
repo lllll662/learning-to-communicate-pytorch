@@ -30,5 +30,10 @@
    "icl_plan_temperature": 0.7,
    "icl_plan_max_tokens": 768,
    "icl_seed": 0,
-   "bs": 32
+   "bs": 128,
+   "icl_check_protocol": "revise",
+   "icl_check_min": 0.65,
+   "icl_check_retries": 2,
+   "icl_prefill": true,
+   "icl_notes": true
 }

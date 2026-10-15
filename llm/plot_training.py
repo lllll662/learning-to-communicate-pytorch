@@ -104,15 +104,18 @@ def set_xlim_with_label_room(ax, x_max, room=0.13):
 
 
 def end_labels(ax, items):
-	"""items: [(x, y, 文字)]，在每条线的末端标注名称；末端靠得太近时依次往上错开"""
+	"""items: [(x, y, 文字)]，在每条线的末端标注名称；末端靠得太近时依次往上错开，超出上边界就整体往下挪"""
 	lo, hi = ax.get_ylim()
 	x_lo, x_hi = ax.get_xlim()
 	gap = (hi - lo) * 0.07
-	prev = None
+	placed = []
 	for x, y, text in sorted(items, key=lambda t: t[1]):
-		y_text = y if prev is None else max(y, prev + gap)
-		prev = y_text
-		ax.text(x + (x_hi - x_lo) * 0.012, y_text, text, va='center', ha='left', color=INK_2, fontsize=8.5)
+		y_text = y if not placed else max(y, placed[-1][1] + gap)
+		placed.append((x, y_text, text))
+	overflow = placed[-1][1] - (hi - gap * 0.5) if placed else 0
+	for x, y_text, text in placed:
+		ax.text(x + (x_hi - x_lo) * 0.012, y_text - max(0, overflow), text, va='center', ha='left',
+			color=INK_2, fontsize=8.5)
 
 
 def reference_lines(ax, baseline, x_max):

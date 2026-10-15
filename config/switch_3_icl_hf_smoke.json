@@ -26,5 +26,7 @@
    "icl_plan_max_tokens": 200,
    "icl_seed": 0,
    "bs": 2,
-   "cuda": 0
+   "cuda": 0,
+   "icl_check_protocol": "report",
+   "icl_prefill": true
 }
