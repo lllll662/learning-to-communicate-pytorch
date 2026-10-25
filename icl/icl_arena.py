@@ -198,33 +198,46 @@ class ICLArena(LLMArena):
 
 	# ---------------- 协议检查 ----------------
 
-	def compile_protocol(self, backends, protocol):
-		"""每个 agent 用自己的 LLM 把协议翻译成决策表：{agent_id: {局面: option}}，外加解析失败数"""
+	def compile_protocol(self, backends, protocol, agents=None):
+		"""
+		每个 agent 用自己的 LLM 把协议翻译成决策表：返回 ({agent_id: {局面: option}}, 解析失败数, 原始输出记录)
+		agents：只让这些 agent 编译（比如只用 1 号做快速对比），其余 agent 沿用 1 号的表
+		"""
 		opt = self.opt
+		agents = agents or list(range(1, opt.game_nagents + 1))
 		sits = PC.situations(opt.nsteps)
 		reqs = {a: [{'messages': P.build_compile_messages(opt, protocol, s, a), 'meta': dict(s, phase='compile')}
-			for s in sits] for a in range(1, opt.game_nagents + 1)}
+			for s in sits] for a in agents}
 		replies = self.query(backends, reqs, temperature=0.0)
-		tables, fails = {}, 0
+		tables, fails, raw = {}, 0, []
 		for a, texts in replies.items():
 			tables[a] = {}
-			for s, text in zip(sits, texts):
+			for s, q, text in zip(sits, reqs[a], texts):
 				option, _ = P.parse_decision(text)
 				fails += option is None
 				tables[a][PC.key(s)] = pb.OPTION_OFF if option is None else option
-		return tables, fails
+				raw.append({'agent': a, 'situation': PC.describe(PC.key(s)), 'parsed': option is not None,
+					'action': PC.ACTION_NAME.get(option, 'PARSE FAIL'), 'output': P.prefill_of(q['messages']) + text})
+		for a in range(1, opt.game_nagents + 1):
+			tables.setdefault(a, tables[agents[0]])
+		return tables, fails, raw
 
-	def check_protocol(self, backends, protocol, r, tag=''):
-		"""编译 + 穷举评估；报告存成 round_xx/protocol_check{tag}.md，返回 (指标, 报告文字)"""
+	def check_protocol(self, backends, protocol, r, tag='', agents=None):
+		"""
+		编译 + 穷举评估，返回 (指标, 报告文字)。写入 round_xx/：
+		protocol_check{tag}.md（报告）、protocol_table{tag}.json（决策表）、protocol_compile{tag}.jsonl（编译的原始输出）
+		"""
 		opt = self.opt
-		tables, fails = self.compile_protocol(backends, protocol)
+		tables, fails, raw = self.compile_protocol(backends, protocol, agents)
 		res = PC.evaluate(tables, opt.game_nagents, opt.nsteps)
 		res['compile_fail'] = fails
 		text = PC.report(res, tables, opt.nsteps, self.check_min)
 		self.ws.write(f'protocol_check{tag}.md', text, r)
 		self.ws.write_json(f'protocol_table{tag}.json', PC.table_to_json(tables), r)
+		self.ws.write_jsonl(f'protocol_compile{tag}.jsonl', raw, r)
 		print(f'  protocol check{tag}: value if executed perfectly {res["value"]:.2f}, '
-			f'uses bulb {res["uses_bulb"]}, agents disagree on {res["disagree"]:.0%} of situations')
+			f'uses bulb {res["uses_bulb"]}, agents disagree on {res["disagree"]:.0%} of situations, '
+			f'parse fail {fails}/{len(raw)}')
 		return res, text
 
 	def checked_protocol(self, backends, protocol, r, planned, context=None):

@@ -16,3 +16,6 @@ logs/
 results/
 models/
 data/
+# local API keys
+.deepseek_key
+.env

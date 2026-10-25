@@ -53,7 +53,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `icl/backend.py` | 后端：`vllm`（每个 agent 连自己的 HTTP 服务，只用标准库）、`hf`（进程内每个 agent 各加载一份模型，CPU 冒烟用）、`rule`（按 oracle 协议作答的假 LLM，验证流程用） |
+| `icl/backend.py` | 后端：`vllm`（每个 agent 连自己的 HTTP 服务，只用标准库）、`hf`（进程内推理，CPU 冒烟或单卡本机；同一模型只加载一份权重）、`rule`（按 oracle 协议作答的假 LLM，验证流程用） |
 | `icl/prompts.py` | 规则说明、决策 / 讨论 / 整理协议 / 审阅 / 总结经验的 prompt，JSON 解析 |
 | `icl/memory.py` | `Workspace`：所有上下文落成文件（目录结构见文件开头的注释） |
 | `icl/icl_arena.py` | `ICLArena(LLMArena)`：比赛、商定、复盘、主循环、续跑 |
@@ -88,6 +88,15 @@ python -m icl.diagnose results/icl_given_0                          # 按规则�
 被打断后用同样的命令重新运行，会从下一轮接着跑。想从头开始：换 `icl_run_dir`、删掉 `state.json`，或者设 `"icl_resume": false`。
 
 换模型只需要用新模型重新运行 `launch_vllm.sh`，不用改配置，因为模型名固定是 agent1..3。比较不同模型时，记得换 `icl_run_dir`，否则会接着上一次的实验继续跑。
+
+### 4.1 单卡本机（Windows，RTX 4080 Laptop 12 GB，没有 vLLM）
+
+`config/switch_3_icl_{given,plan,reflect}_local.json` 的实验参数和服务器配置相同，只是改用 hf 后端（`cuda: 1`），运行目录是 `results/icl_*_local_v2`。
+
+- 3 个 agent 填同一个 `model_path` 时，`HFBackend` 只加载一份权重（3B 约 5.9 GB），因为 12 GB 放不下 3 份。这仍然算独立实例：权重只读；每次 `generate` 都新建 KV cache；hf 分支按 agent 依次调用，不同 agent 的请求不会进同一个 batch。
+- `icl_hf_batch: 16` 是实测选的。batch 为 16 / 32 / 48 时，显存峰值分别是 7.1 / 8.4 / 9.6 GB。但 batch 加大一倍，每个 token 的耗时也差不多翻倍，因为瓶颈在 HF `generate` 的逐 token 开销，GPU 利用率只有 10–60%。48 已经接近显存上限，反而更慢。
+- 笔记本在长时间负载下会到 85–89°C 并降频（2400 → 1300 MHz 以下），速度可能再慢一倍。建议接电源、垫高机身或用散热垫，并打开厂商的性能模式。
+- 无人值守运行：`.venv\Scripts\python -u -m icl.run_batch <配置...> -r results`。
 
 ## 5. 验证（CPU）
 
@@ -157,3 +166,82 @@ python -m icl.diagnose results/icl_given_0                          # 按规则�
 - `rule` 配置仍为 1.0，协议检查 1.0，R1–R4 全部 1.0；
 - 用模拟后端先给一份坏协议（"第一次来且第 3 天以后宣布"）：检查得 0.28（理论值 0.278），报告指出灯泡没用到、第 3 天说错率 50%；改写后的协议得 1.0 并被采用；
 - `evaluate` 算出的分数和理论值一致："只在第 6 天宣布" 0.65、oracle 1.0。
+
+## 8. 第三次改动：逐条核对条件的决策格式（2026-10-15）
+
+**问题**（`results/icl_given_local_v2_0`，3B，hf，单卡本机）：第二版格式（`FACTS → RULE → CHECK`）下，E1 每局都在第 1 天宣布，全输，reward 约 −1.35。
+- FACTS 一行写对了（灯 OFF、第一次来），RULE 却引用规则 1（灯 ON 且第一次来 → 宣布）；CHECK 写的是"规则 2、3、4 不适用"，还把事实说反了。
+- 编译出的决策表只有 38/87 和最优协议一致。规律是**只要是第一次来就宣布，不看灯**：模型只核对了合取条件里和事实字面重合的那一半。
+- 第一版正好相反（灯 ON 时套用"灯 ON → 开灯"，从不宣布）。两次都是"哪条规则和事实字面重合最明显就套哪条"，prompt 格式只改变了哪一半更显眼。
+- 第二版格式本身的缺陷：没有任何一步核对所选规则自己的条件；选的是规则 1 时，CHECK（解释前面的规则）没有内容可写，只能编造。
+
+**改动**：
+- `icl_decision_format`：
+  - `conditions`（新的默认）：逐条规则、逐个条件写 `= yes/no`，所有条件都是 yes 的第一条规则才适用；
+  - `rule_check`：第二版；
+  - `free`：第一版的自由推理，不预填。
+  比赛和编译协议用同一种格式。
+- 编译协议的原始输出存成 `round_xx/protocol_compile*.jsonl`（之前只存了解析结果，查不到 24% 解析失败的原因）。
+- `icl/compare_formats.py`：只做编译检查（29 个局面 × 每种格式），对比各格式和最优协议的一致数、完美执行分数、解析失败，以及按"是否第一次来 × 灯"分组的选择。改 prompt 时先用它迭代，再跑完整对局：
+  ```
+  python -m icl.compare_formats -c config/switch_3_icl_given_local.json --formats rule_check conditions --agents 1
+  ```
+- `icl_hf_dtype`：hf 后端的精度（比如 CPU 内存不够时用 `"bfloat16"`）。
+
+**验证**（CPU）：
+- `rule` 配置仍为 1.0；`compare_formats` 在 rule 后端下三种格式都是 87/87。
+- 0.5B 上两种格式都能跑通，但 `conditions` 只有 31% 的输出照格式写了 `= yes/no`（`rule_check` 是 100%）。0.5B 在哪种格式下都做不了这个任务，分数没有参考意义。为了区分"没照格式写"和"照写了但判断错"，`compare_formats` 加了 "format followed" 一列。
+- 本机 CPU（16GB 内存）跑 3B 不现实：bf16 + 换页，70 分钟连一种格式的 29 次生成都没跑完。**3B 的格式对比要在 GPU 电脑上跑。**
+
+**3B 第一次格式对比**（`results/format_compare`）：新格式一致数 20/29（旧格式 14/29），但这**不是逐条核对带来的**。
+- 22/29 条输出原样照抄了模板里的 `= yes/no`、`-> applies / does not apply`，没有一条真正填写了 yes 或 no；条件栏里塞的是整条规则原文。
+- 原因：旧格式的占位放在 `<...>` 里，模型会替换；新格式的 `yes/no` 没放进 `<...>`，3B 当成了要原样输出的文字。
+- 照抄之后它凭直觉直接给动作：灯 OFF 的局面几乎全对，但一次都不宣布。旧格式则是会推理，但只看一半条件。
+- 对比工具里"照格式写"的检查原来会把照抄的 `= yes/no` 算成已填写，已修正（这次数据重算：新格式 0%）。
+
+**模板修正**：
+- 所有占位都放进 `<...>`，并明确要求不要照抄；
+- 加一个和本任务无关的、已填好的示例（下雨 / 带伞，演示"合取条件里有一个 no，这条规则就不适用"），放在格式说明之前，不暗示任何策略；
+- 新增 `DECISION: <规则编号> -> <动作>` 一行，把规则对应到动作；
+- 解析器兜底：没写 JSON、停在 DECISION 行时，从 DECISION 行读出动作；
+- "照格式写"现在要求真的填了 yes/no，而且没有照抄 `<...>` 或下雨的示例。
+
+0.5B 上新模板仍然不会照做（把答案写在 `<...>` 里、照抄示例），这在预期之内。3B 的效果要在 GPU 上重跑 `compare_formats` 确认。
+
+## 9. DeepSeek 在线 API 后端（2026-10-25）
+
+为了在跑本地模型之前先确认"换个更强的模型，框架是否可行"，加了一个在线 API 后端。
+
+- **配置**：`config/switch_3_icl_deepseek.json`，`icl_backend: "deepseek"`，每条请求用 `{"model": "deepseek-chat"}`。
+  端点默认 `https://api.deepseek.com/beta/chat/completions`（`/beta` 支持预填回复开头）。
+- **key 只从本地读取，不写进配置和仓库**：环境变量 `DEEPSEEK_API_KEY`，或者仓库根目录的 `.deepseek_key`、
+  `~/.deepseek_key`（后两者已在 `.gitignore` 里）。配置文件里只有模型名。
+- **预填**：请求里最后一条 assistant 消息带 `"prefix": true`，模型接着它往下写。如果端点返回 400（不支持预填），
+  自动退回"在 user 消息里要求回复以某段文字开头"。
+- **解析**：`content` 为空时读 `reasoning_content`（思考类模型会把思考过程放这里）。
+- **限流**：429 / 5xx 按 4、8、16、32 秒退避重试；`icl_concurrency` 默认 4，别开太高。
+- **可用模型**（2026-10 实测）：`deepseek-chat`、`deepseek-flash`、`deepseek-v4-pro`。
+
+**验证**：用本地 mock 服务（模拟 prefix 预填和响应格式）跑通了单次调用和 `main.py` 的完整一轮（比赛 + 协议检查 + 指标 + 画图），
+没有消耗真实额度。真实 API 的连通性、模型列表和 prefix 续写也已单独确认。
+
+用法：
+```bash
+echo 'sk-...' > .deepseek_key          # 一次性，文件不会被提交
+python -u main.py -c config/switch_3_icl_deepseek.json -r results
+python -m icl.compare_formats -c config/switch_3_icl_deepseek.json --formats conditions rule_check --agents 1
+```
+
+**结果**（`deepseek-chat`，3 个 agent 共用一个 API，每轮 32 局，2026-10-25）：
+
+| 实验 | 结果 |
+|---|---|
+| 协议编译（最优协议） | 两种格式都是 87/87，3 个 agent 的表完全一致（3B：10–14/29） |
+| E1 给定协议（`results/deepseek_given_0`） | 4 轮全部 1.0；R1–R4 正确率 100%；所有宣布都在灯 ON 时，全部正确 |
+| E2 赛前商定（`results/deepseek_plan_0`） | 设计出"1 号计数、2/3 号各开一次灯"的经典计数员协议，从不说错，但 6 天里很难数满。按协议写成程序穷举，理论值 0.185；实际 4 轮均值 0.15 |
+| E3 复盘迭代（`results/deepseek_reflect_0`） | 第 0 轮协议是"第 6 天宣布（加一个几乎不触发的过滤条件）"，检查 0.65、实际 0.61，相当于不通信的基线。之后每轮复盘都加条件，协议从 1.9KB 涨到 4.4KB，检查分数 0.49 → 0；第 4 轮起基本不再宣布。10 轮均值 0.11 |
+
+结论：
+- 换成强模型后，**执行给定协议没有问题**，说明 3B 的失败是能力问题，框架本身可行。
+- 但 DeepSeek **自己设计的协议都没超过不通信的 0.65**：E2 选了安全但赢得少的计数员协议，E3 找到第 6 天宣布之后，复盘让协议越改越复杂、越来越保守，最后不再宣布。
+- **协议检查的局限**：计数员协议依赖笔记里的计数 c，超出了 4 个特征；编译时又写了"没有笔记"，所以 c 总是 0，检查判它"从不宣布"（0.00–0.11），但实际比赛中能正确宣布。另外有角色分工的协议，"各 agent 理解不一致"（69%）是设计使然，不代表协议有歧义。所以 E2/E3 的 `revise` 是在被低估的分数上打回协议。改进方向：编译时把"笔记里的计数"也作为局面特征，或者直接用比赛记录评估协议。

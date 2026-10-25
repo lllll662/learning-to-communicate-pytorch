@@ -1,0 +1,32 @@
+{
+   "game": "switch",
+   "agent_type": "icl",
+   "game_nagents": 3,
+   "game_action_space": 2,
+   "game_comm_limited": true,
+   "game_comm_bits": 1,
+   "model_dial": false,
+   "icl_backend": "deepseek",
+   "icl_agents": [
+      {
+         "model": "deepseek-chat"
+      }
+   ],
+   "icl_protocol_file": "icl/protocols/switch_3_oracle.md",
+   "icl_decision_format": "conditions",
+   "icl_prefill": true,
+   "icl_notes": true,
+   "icl_temperature": 0.0,
+   "icl_max_tokens": 1024,
+   "icl_plan_temperature": 0.7,
+   "icl_plan_max_tokens": 2048,
+   "icl_concurrency": 4,
+   "icl_timeout": 300,
+   "icl_check_protocol": "report",
+   "icl_rounds": 4,
+   "icl_reflect": false,
+   "icl_run_dir": "results/deepseek_given",
+   "icl_seed": 0,
+   "bs": 32,
+   "cuda": 0
+}

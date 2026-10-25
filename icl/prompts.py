@@ -36,11 +36,18 @@ def rules(opt):
 
 # ---------------- 比赛中的决策 ----------------
 
-# 决策回复的固定格式：先写事实、引用规则、说明前面的规则为什么不适用，最后才给 JSON。
-# 3B 模型在自由推理时会先给答案再补理由（E1 中 30% 的输出），还会跳过规则 1，所以把推理步骤写死，
-# 并在 assistant 回复开头预填 DECISION_PREFILL，保证先推理后作答（icl_prefill=false 可关闭）
+# 决策回复的格式（icl_decision_format）：
+#	conditions（默认）：逐条规则、逐个条件写 yes/no，所有条件都是 yes 的第一条规则才适用，最后给 JSON
+#	rule_check：FACTS → RULE（引用一条规则）→ CHECK（前面的规则为什么不适用）→ JSON（第二版）
+#	free：自由推理后给 JSON，不预填（第一版的做法）
+# 第一版 3B 会先给答案再补理由、跳过规则 1；第二版 rule_check 下又只匹配合取条件的一半
+# （"第一次来"就宣布，不看灯是不是 ON），CHECK 也不核对所选规则自己的条件。
+# 所以 conditions 要求把每条规则的每个条件都对照事实写出来。
+# 第一版 conditions 模板里的 "yes/no"、"applies / does not apply" 没放进 <...>，3B 原样照抄、一个 yes/no 都没填，
+# 所以占位全部改成 <...>，并附一个和本任务无关的填好的示例（下雨 / 带伞），最后用 DECISION 行把规则对应到动作。
+# 预填 DECISION_PREFILL 保证先推理后作答（icl_prefill=false 可关闭；free 格式不预填）
+DECISION_FORMATS = ('conditions', 'rule_check', 'free')
 DECISION_PREFILL = 'FACTS:'
-COMPILE_PREFILL = 'RULE:'
 # 模板里的占位说明，模型照抄时当作空笔记（E1 中 34% 的笔记是照抄的 "notes for your future visits"）
 NOTE_PLACEHOLDERS = ('what you want to remember', 'notes for your future visits', 'or empty')
 
@@ -76,14 +83,47 @@ def fact_lines(day, bulb, first_visit, here_yesterday, prev_days=None):
 	return lines
 
 
-def _apply_instructions(json_line):
+def decision_format(opt):
+	fmt = opt.icl_decision_format or 'conditions'
+	assert fmt in DECISION_FORMATS, f'icl_decision_format must be one of {DECISION_FORMATS}'
+	return fmt
+
+
+def _apply_instructions(opt, json_line):
+	fmt = decision_format(opt)
+	if fmt == 'free':
+		return ['Decide what to do by following the protocol. Think step by step briefly, then end your reply '
+			'with a JSON object on its own line:', json_line]
+	if fmt == 'rule_check':
+		return [
+			'Apply the protocol: go through its rules in order and use the FIRST rule whose conditions all hold '
+			'for these facts.',
+			'Reply in exactly this format, with the JSON only at the very end:',
+			'FACTS: <the facts above, in one line>',
+			'RULE: <quote the rule you apply>',
+			'CHECK: <in one line, why each earlier rule does not apply>',
+			json_line,
+		]
 	return [
-		'Apply the protocol: go through its rules in order and use the FIRST rule whose conditions all hold '
-		'for these facts.',
-		'Reply in exactly this format, with the JSON only at the very end:',
+		'Apply the protocol by checking its rules one at a time, starting from rule 1. Split each rule into its '
+		'separate conditions (one fact each) and write yes or no for each condition, using the facts above. A rule '
+		'applies only if all of its conditions are yes. Stop at the first rule that applies and do what it says.',
+		'',
+		# 示例用和本任务无关的规则，只演示格式和"合取条件有一个 no 就不适用"，不暗示任何策略。
+		# 放在格式说明前面，这样 prompt 的最后是以 JSON 结尾的格式，模型不会学着示例在 DECISION 行就停下
+		'Example of the reasoning, for a different task. Rules: 1. If it is raining and you have an umbrella, go '
+		'outside. 2. If it is raining, stay inside. Facts: it is raining; you have no umbrella.',
+		'Rule 1: it is raining = yes; you have an umbrella = no -> does not apply',
+		'Rule 2: it is raining = yes -> applies',
+		'DECISION: rule 2 -> stay inside',
+		'',
+		'Now reply for your own situation in exactly this format, with the JSON only at the very end. Replace every '
+		'<...> with your own words; never copy a <...> placeholder:',
 		'FACTS: <the facts above, in one line>',
-		'RULE: <quote the rule you apply>',
-		'CHECK: <in one line, why each earlier rule does not apply>',
+		'Rule 1: <first condition> = <yes or no>; <second condition, if the rule has one> = <yes or no> '
+		'-> <applies or does not apply>',
+		'Rule 2: <the same for rule 2; continue until a rule applies>',
+		'DECISION: <number of the rule that applies> -> <what that rule says to do>',
 		json_line,
 	]
 
@@ -108,7 +148,7 @@ def build_decision_messages(opt, agent_id, day, bulb, facts, notes, protocol):
 		'',
 		'"OFF" / "ON" sets the bulb for the next prisoner; "ANNOUNCE" ends the game.'
 		+ (' "memory" replaces your previous notes.' if notes_enabled else ''),
-		*_apply_instructions(json_line),
+		*_apply_instructions(opt, json_line),
 	]
 	return _with_prefill(opt, [{'role': 'system', 'content': rules(opt)}, {'role': 'user', 'content': '\n'.join(lines)}],
 		DECISION_PREFILL)
@@ -116,7 +156,7 @@ def build_decision_messages(opt, agent_id, day, bulb, facts, notes, protocol):
 
 def _with_prefill(opt, messages, prefill):
 	"""在 assistant 回复开头预填固定文字，后端会接着它往下生成（vllm: continue_final_message）"""
-	if opt.icl_prefill is False:
+	if opt.icl_prefill is False or decision_format(opt) == 'free':
 		return messages
 	return messages + [{'role': 'assistant', 'content': prefill}]
 
@@ -142,7 +182,25 @@ def parse_decision(text):
 		if option is not None:
 			notes = re.findall(r'"memory"\s*:\s*"(.*?)"\s*\}', text, re.S)
 			return option, _clean_notes(notes[-1] if notes else '')
+	# conditions 格式没写 JSON、停在 DECISION 行时：从 DECISION 行读动作（优先看 "->" 后面的部分）
+	lines = re.findall(r'^\s*DECISION:(.*)$', text, re.M)
+	if lines:
+		line = lines[-1]
+		for part in (line.rsplit('->', 1)[-1], line):
+			option = _action_in_words(part)
+			if option is not None:
+				return option, ''
 	return None, ''
+
+
+def _action_in_words(text):
+	if re.search(r'announc', text, re.I):
+		return OPTION_TELL
+	if re.search(r'\bON\b', text, re.I):
+		return OPTION_ON
+	if re.search(r'\bOFF\b', text, re.I):
+		return OPTION_OFF
+	return None
 
 
 def _clean_notes(notes):
@@ -253,7 +311,7 @@ def build_compile_messages(opt, protocol, situation, agent_id):
 		*fact_lines(s['day'], s['bulb'], s['first'], s['yesterday']),
 		'',
 		'What does the protocol tell you to do?',
-		*_apply_instructions('{"action": "<OFF, ON or ANNOUNCE>"}'),
+		*_apply_instructions(opt, '{"action": "<OFF, ON or ANNOUNCE>"}'),
 	]
 	return _with_prefill(opt, [{'role': 'system', 'content': rules(opt)}, {'role': 'user', 'content': '\n'.join(lines)}],
 		DECISION_PREFILL)
