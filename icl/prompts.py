@@ -8,7 +8,8 @@
 import json
 import re
 
-from llm.prompt_builder import OPTION_OFF, OPTION_ON, OPTION_TELL, bulb_str, describe_option
+from llm.prompt_builder import OPTION_OFF, OPTION_ON, OPTION_TELL
+from icl.texts import texts, bulb_word
 
 # 决策输出里 action 字段的取值 → 游戏选项
 ACTIONS = {'OFF': OPTION_OFF, 'ON': OPTION_ON, 'ANNOUNCE': OPTION_TELL}
@@ -17,21 +18,7 @@ ACTION_ALIASES = {'TELL': 'ANNOUNCE', 'C': 'ANNOUNCE', 'A': 'OFF', 'B': 'ON'}
 
 def rules(opt):
 	"""所有阶段共用的规则说明（和 llm.prompt_builder.system_prompt 相同的游戏，但每个囚犯是独立的个体）"""
-	n, T = opt.game_nagents, opt.nsteps
-	return (
-		f"You are one of {n} prisoners (numbered 1 to {n}) in a cooperative puzzle.\n"
-		f"The game lasts {T} days. Each day the warden picks one prisoner uniformly at random and brings "
-		f"them into a room with a light bulb. The same prisoner can be picked several times, and some "
-		f"prisoners may never be picked.\n"
-		f"When you enter the room you see the bulb exactly as the previous day's prisoner left it "
-		f"(on day 1 it is OFF). Before leaving you either set the bulb ON or OFF for the next prisoner, "
-		f"or you announce: \"Every prisoner has visited the room.\"\n"
-		f"If the announcement is correct, everyone wins (reward +1). If it is wrong, everyone loses "
-		f"(reward -1). If nobody announces within {T} days, the reward is 0.\n"
-		f"During the game prisoners cannot talk to each other: the bulb is the only signal, and it only "
-		f"reaches the prisoner who enters the next day. Before the game the prisoners may meet and agree "
-		f"on a protocol, written down in protocol.md. Each prisoner also keeps a private memory.md."
-	)
+	return texts(opt)['rules'].format(n=opt.game_nagents, T=opt.nsteps)
 
 
 # ---------------- 比赛中的决策 ----------------
@@ -49,37 +36,44 @@ def rules(opt):
 DECISION_FORMATS = ('conditions', 'rule_check', 'free')
 DECISION_PREFILL = 'FACTS:'
 # 模板里的占位说明，模型照抄时当作空笔记（E1 中 34% 的笔记是照抄的 "notes for your future visits"）
-NOTE_PLACEHOLDERS = ('what you want to remember', 'notes for your future visits', 'or empty')
+NOTE_PLACEHOLDERS = ('what you want to remember', 'notes for your future visits', 'or empty', '以后来访时想记住', '可以为空')
 
 
-def render_memory(facts, notes, notes_enabled=True):
+def _did(opt, option):
+	t = texts(opt)
+	return t['did_announce'] if option == OPTION_TELL else t['did_bulb'].format(bulb=bulb_word(opt, option))
+
+
+def render_memory(facts, notes, notes_enabled=True, opt=None):
 	"""
 	一个 agent 的 memory.md
 	facts: 程序记录的客观访问历史 [(day, 看到的bit, option), ...]
 	notes: agent 自己写的笔记（每次决策时覆盖）；notes_enabled=false 时不显示（消融：只靠客观记录）
 	"""
-	lines = ['## Visits (recorded automatically)']
+	t = texts(opt)
+	lines = [t['visits_header']]
 	if facts:
-		lines += [f"- day {d}: the bulb was {bulb_str(seen)}, you {describe_option(o)}." for d, seen, o in facts]
+		lines += [t['visit_line'].format(d=d, seen=bulb_word(opt, seen), did=_did(opt, o)) for d, seen, o in facts]
 	else:
-		lines.append('- none: this is your first visit.')
+		lines.append(t['no_visits'])
 	if notes_enabled:
-		lines += ['', '## Your notes', notes.strip() if notes and notes.strip() else '(empty)']
+		lines += ['', t['notes_header'], notes.strip() if notes and notes.strip() else t['notes_empty']]
 	return '\n'.join(lines)
 
 
-def fact_lines(day, bulb, first_visit, here_yesterday, prev_days=None):
+def fact_lines(day, bulb, first_visit, here_yesterday, prev_days=None, opt=None):
 	"""今天确定知道的事实。都能从访问记录推出来，但直接写明，避免小模型读错（E1 里常把第一次来访说成不是）"""
-	lines = [f'- The bulb is {bulb_str(bulb)}.']
+	t = texts(opt)
+	lines = [t['fact_bulb'].format(bulb=bulb_word(opt, bulb))]
 	if first_visit:
-		lines.append('- This is your first visit to the room.')
+		lines.append(t['fact_first'])
 	else:
-		days = f' (you were here on day {", ".join(map(str, prev_days))})' if prev_days else ''
-		lines.append(f'- This is NOT your first visit{days}.')
+		days = t['fact_days'].format(days=t['list_sep'].join(map(str, prev_days))) if prev_days else ''
+		lines.append(t['fact_not_first'].format(days=days))
 	if day == 1:
-		lines.append('- Today is day 1, so nobody was in the room yesterday.')
+		lines.append(t['fact_day1'])
 	else:
-		lines.append(f'- Yesterday (day {day - 1}) you were{"" if here_yesterday else " NOT"} the prisoner in the room.')
+		lines.append(t['fact_yesterday'].format(y=day - 1, neg='' if here_yesterday else t['neg']))
 	return lines
 
 
@@ -91,67 +85,37 @@ def decision_format(opt):
 
 def _apply_instructions(opt, json_line):
 	fmt = decision_format(opt)
+	t = texts(opt)
 	if fmt == 'free':
-		return ['Decide what to do by following the protocol. Think step by step briefly, then end your reply '
-			'with a JSON object on its own line:', json_line]
-	if fmt == 'rule_check':
-		return [
-			'Apply the protocol: go through its rules in order and use the FIRST rule whose conditions all hold '
-			'for these facts.',
-			'Reply in exactly this format, with the JSON only at the very end:',
-			'FACTS: <the facts above, in one line>',
-			'RULE: <quote the rule you apply>',
-			'CHECK: <in one line, why each earlier rule does not apply>',
-			json_line,
-		]
-	return [
-		'Apply the protocol by checking its rules one at a time, starting from rule 1. Split each rule into its '
-		'separate conditions (one fact each) and write yes or no for each condition, using the facts above. A rule '
-		'applies only if all of its conditions are yes. Stop at the first rule that applies and do what it says.',
-		'',
-		# 示例用和本任务无关的规则，只演示格式和"合取条件有一个 no 就不适用"，不暗示任何策略。
-		# 放在格式说明前面，这样 prompt 的最后是以 JSON 结尾的格式，模型不会学着示例在 DECISION 行就停下
-		'Example of the reasoning, for a different task. Rules: 1. If it is raining and you have an umbrella, go '
-		'outside. 2. If it is raining, stay inside. Facts: it is raining; you have no umbrella.',
-		'Rule 1: it is raining = yes; you have an umbrella = no -> does not apply',
-		'Rule 2: it is raining = yes -> applies',
-		'DECISION: rule 2 -> stay inside',
-		'',
-		'Now reply for your own situation in exactly this format, with the JSON only at the very end. Replace every '
-		'<...> with your own words; never copy a <...> placeholder:',
-		'FACTS: <the facts above, in one line>',
-		'Rule 1: <first condition> = <yes or no>; <second condition, if the rule has one> = <yes or no> '
-		'-> <applies or does not apply>',
-		'Rule 2: <the same for rule 2; continue until a rule applies>',
-		'DECISION: <number of the rule that applies> -> <what that rule says to do>',
-		json_line,
-	]
+		return [t['free'], json_line]
+	# conditions 的示例用和本任务无关的规则（下雨 / 带伞），只演示格式和"合取条件有一个 no 就不适用"，不暗示任何策略；
+	# 示例放在格式说明前面，这样 prompt 的最后是以 JSON 结尾的格式，模型不会学着示例在 DECISION 行就停下
+	return list(t[fmt]) + [json_line]
 
 
 def build_decision_messages(opt, agent_id, day, bulb, facts, notes, protocol):
 	notes_enabled = opt.icl_notes is not False
 	first_visit = not facts
 	here_yesterday = bool(facts) and facts[-1][0] == day - 1
-	json_line = ('{"action": "<OFF, ON or ANNOUNCE>", "memory": "<what you want to remember on later visits, or empty>"}'
-		if notes_enabled else '{"action": "<OFF, ON or ANNOUNCE>"}')
+	t = texts(opt)
+	json_line = t['json_with_memory'] if notes_enabled else t['json_action']
 	lines = [
-		'# protocol.md (agreed by all prisoners before the game)',
+		t['protocol_header'],
 		protocol.strip(),
 		'',
-		'# memory.md (your private memory; nobody else can read it)',
-		render_memory(facts, notes, notes_enabled),
+		t['memory_header'],
+		render_memory(facts, notes, notes_enabled, opt),
 		'',
-		'# Today',
-		f"You are prisoner {agent_id}. Today is day {day} of {opt.nsteps}. You are in the room.",
-		'Facts you know for sure:',
-		*fact_lines(day, bulb, first_visit, here_yesterday, [d for d, _, _ in facts]),
+		t['today_header'],
+		t['today'].format(a=agent_id, day=day, T=opt.nsteps),
+		t['facts_intro'],
+		*fact_lines(day, bulb, first_visit, here_yesterday, [d for d, _, _ in facts], opt),
 		'',
-		'"OFF" / "ON" sets the bulb for the next prisoner; "ANNOUNCE" ends the game.'
-		+ (' "memory" replaces your previous notes.' if notes_enabled else ''),
+		t['action_note'] + (t['memory_note'] if notes_enabled else ''),
 		*_apply_instructions(opt, json_line),
 	]
 	return _with_prefill(opt, [{'role': 'system', 'content': rules(opt)}, {'role': 'user', 'content': '\n'.join(lines)}],
-		DECISION_PREFILL)
+		t['prefill'])
 
 
 def _with_prefill(opt, messages, prefill):
@@ -194,11 +158,12 @@ def parse_decision(text):
 
 
 def _action_in_words(text):
-	if re.search(r'announc', text, re.I):
+	# 中文 prompt 下 DECISION 行可能写"宣布 / 开灯 / 关灯"
+	if re.search(r'announc|宣布', text, re.I):
 		return OPTION_TELL
-	if re.search(r'\bON\b', text, re.I):
+	if re.search(r'\bON\b|开灯|设为开|保持开|打开', text, re.I):
 		return OPTION_ON
-	if re.search(r'\bOFF\b', text, re.I):
+	if re.search(r'\bOFF\b|关灯|设为关|保持关|关闭|关掉', text, re.I):
 		return OPTION_OFF
 	return None
 
@@ -218,61 +183,55 @@ def _to_option(action):
 
 # ---------------- 赛前商定协议 / 赛后复盘 ----------------
 
-def _context_block(context):
+def _context_block(context, opt=None):
 	"""E3：上一轮的协议、复盘和累积的经验"""
 	if not context:
 		return []
+	t = texts(opt)
 	lines = []
 	if context.get('protocol'):
-		lines += ['# Protocol used in the previous round', context['protocol'].strip(), '']
+		lines += [t['prev_protocol'], context['protocol'].strip(), '']
 	if context.get('debrief'):
-		lines += ['# Debrief of the previous round', context['debrief'].strip(), '']
+		lines += [t['prev_debrief'], context['debrief'].strip(), '']
 	if context.get('lessons'):
-		lines += ['# Lessons learned so far', context['lessons'].strip(), '']
+		lines += [t['lessons_so_far'], context['lessons'].strip(), '']
 	return lines
 
 
 def _protocol_requirements(opt):
-	return (f"The protocol must be a short list of precise rules that a prisoner can apply alone, during the "
-		f"game, using only: the day number (1 to {opt.nsteps}), the bulb state seen when entering, whether "
-		f"they were in the room yesterday, their own visit history, and their own private notes.")
+	return texts(opt)['requirements'].format(T=opt.nsteps)
 
 
 def build_discussion_messages(opt, agent_id, turn, nturns, transcript, context=None):
-	lines = _context_block(context) + [
-		f"The prisoners are meeting before the game to agree on a protocol. You are prisoner {agent_id}.",
+	t = texts(opt)
+	lines = _context_block(context, opt) + [
+		t['meeting'].format(a=agent_id),
 		_protocol_requirements(opt),
 		'',
-		'# Discussion so far',
-		render_transcript(transcript) or '(nobody has spoken yet)',
+		t['discussion_so_far'],
+		render_transcript(transcript, opt) or t['nobody_spoke'],
 		'',
-		f"It is your turn to speak (round {turn + 1} of {nturns}). Propose a protocol, or point out a concrete "
-		f"flaw in a proposal and fix it. Reply in under 200 words.",
+		t['your_turn'].format(t=turn + 1, nt=nturns),
 	]
 	return [{'role': 'system', 'content': rules(opt)}, {'role': 'user', 'content': '\n'.join(lines)}]
 
 
 def build_draft_messages(opt, transcript, context=None, draft=None, reviews=None):
 	"""1 号整理协议；带 draft/reviews 时是按修改意见改稿"""
-	lines = _context_block(context) + ['# Discussion', render_transcript(transcript), '']
+	t = texts(opt)
+	lines = _context_block(context, opt) + [t['discussion'], render_transcript(transcript, opt), '']
 	if draft is None:
-		lines.append('You are prisoner 1 and act as the scribe. Write the final protocol.md that all prisoners '
-			'will follow, based on the discussion.')
+		lines.append(t['scribe'])
 	else:
-		lines += ['# Your draft protocol.md', draft.strip(), '', '# Suggestions from the other prisoners',
-			'\n'.join(f'- prisoner {k}: {r.strip()}' for k, r in reviews), '',
-			'You are prisoner 1 and act as the scribe. Revise the draft where the suggestions are correct.']
-	lines += [_protocol_requirements(opt), 'Output only the markdown content of protocol.md.']
+		lines += [t['your_draft'], draft.strip(), '', t['suggestions'],
+			'\n'.join(t['suggestion_line'].format(k=k, text=r.strip()) for k, r in reviews), '', t['revise']]
+	lines += [_protocol_requirements(opt), t['output_only']]
 	return [{'role': 'system', 'content': rules(opt)}, {'role': 'user', 'content': '\n'.join(lines)}]
 
 
 def build_review_messages(opt, agent_id, draft):
-	lines = [
-		'# Draft protocol.md', draft.strip(), '',
-		f"You are prisoner {agent_id}. Check whether this protocol can cause a wrong announcement or can be "
-		f"applied ambiguously. If it is fine, reply exactly AGREE. Otherwise reply with one concrete "
-		f"suggestion in under 80 words.",
-	]
+	t = texts(opt)
+	lines = [t['draft_header'], draft.strip(), '', t['review'].format(a=agent_id)]
 	return [{'role': 'system', 'content': rules(opt)}, {'role': 'user', 'content': '\n'.join(lines)}]
 
 
@@ -281,12 +240,12 @@ def is_agree(text):
 
 
 def build_lessons_messages(opt, protocol, debrief, lessons):
+	t = texts(opt)
 	lines = [
-		'# Protocol used in this round', protocol.strip(), '',
-		'# Debrief of this round', debrief.strip(), '',
-		'# Lessons learned in earlier rounds', lessons.strip() or '(none)', '',
-		'You are prisoner 1. Write 1 to 3 new, short lessons (one per line, starting with "- ") that would '
-		'help the prisoners do better next round. Do not repeat earlier lessons.',
+		t['this_protocol'], protocol.strip(), '',
+		t['this_debrief'], debrief.strip(), '',
+		t['earlier_lessons'], lessons.strip() or t['none'], '',
+		t['write_lessons'],
 	]
 	return [{'role': 'system', 'content': rules(opt)}, {'role': 'user', 'content': '\n'.join(lines)}]
 
@@ -300,38 +259,38 @@ def build_compile_messages(opt, protocol, situation, agent_id):
 	带上编号和比赛中一致；同一个模型、贪心解码时，prompt 完全相同会让"理解不一致"永远是 0
 	"""
 	s = situation
+	t = texts(opt)
 	lines = [
-		'# protocol.md (agreed by all prisoners before the game)',
+		t['protocol_header'],
 		protocol.strip(),
 		'',
-		'# Situation',
-		f"You are prisoner {agent_id}. Imagine you enter the room on day {s['day']} of {opt.nsteps}. "
-		f"You have no private notes.",
-		'Facts you know for sure:',
-		*fact_lines(s['day'], s['bulb'], s['first'], s['yesterday']),
+		t['situation_header'],
+		t['situation'].format(a=agent_id, day=s['day'], T=opt.nsteps),
+		t['facts_intro'],
+		*fact_lines(s['day'], s['bulb'], s['first'], s['yesterday'], opt=opt),
 		'',
-		'What does the protocol tell you to do?',
-		*_apply_instructions(opt, '{"action": "<OFF, ON or ANNOUNCE>"}'),
+		t['what_to_do'],
+		*_apply_instructions(opt, t['json_action']),
 	]
 	return _with_prefill(opt, [{'role': 'system', 'content': rules(opt)}, {'role': 'user', 'content': '\n'.join(lines)}],
-		DECISION_PREFILL)
+		t['prefill'])
 
 
 def build_fix_messages(opt, protocol, check_report, context=None):
 	"""协议没通过检查：书记员（1 号）看检查报告改协议"""
-	lines = _context_block(context) + [
-		'# Current protocol.md', protocol.strip(), '',
-		'# Protocol check', check_report.strip(), '',
-		'You are prisoner 1 and act as the scribe. The protocol did not pass the check. Rewrite protocol.md so '
-		'that it fixes the problems found by the check.',
+	t = texts(opt)
+	lines = _context_block(context, opt) + [
+		t['current_protocol'], protocol.strip(), '',
+		t['check_header'], check_report.strip(), '',
+		t['fix'],
 		_protocol_requirements(opt),
-		'Output only the markdown content of protocol.md.',
+		t['output_only'],
 	]
 	return [{'role': 'system', 'content': rules(opt)}, {'role': 'user', 'content': '\n'.join(lines)}]
 
 
-def render_transcript(transcript):
-	return '\n\n'.join(f'**Prisoner {k}:** {text.strip()}' for k, text in transcript)
+def render_transcript(transcript, opt=None):
+	return '\n\n'.join(texts(opt)['transcript_line'].format(k=k, text=text.strip()) for k, text in transcript)
 
 
 def clean_markdown(text):

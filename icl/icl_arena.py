@@ -21,8 +21,10 @@ import torch
 
 from icl import prompts as P
 from icl import protocol_check as PC
+from icl import protocol_eval as PE
 from icl.diagnose import analyze
 from icl.memory import Workspace
+from icl.texts import texts, bulb_word
 from llm import prompt_builder as pb
 from llm.llm_arena import LLMArena, now, fmt_duration
 from utils.dotdic import DotDic
@@ -32,10 +34,11 @@ METRICS_NAME = 'icl_metrics.csv'
 #	reward_se：归一化 reward 的标准误（bootstrap）
 #	announce_*：宣布次数、宣布的胜率、宣布时灯是 ON 的比例（正确的协议只在灯 ON 时宣布）
 #	oracle_acc / acc_R1..R4：和最优协议的一致率（3 人时），E1 中就是执行正确率
-#	protocol_*：协议检查——完美执行时的分数、说错的比例、是否用到灯泡、各 agent 理解不一致的比例
+#	protocol_*：协议评估——重放比赛的归一化奖励、说错的比例、宣布率、是否用到灯泡、解析失败、是否保留了上一版
 METRIC_FIELDS = ['avg_reward', 'reward_se', 'win', 'lose', 'tell_rate', 'parse_fail',
 	'announce_n', 'announce_win_rate', 'announce_bulb_on', 'oracle_acc', 'acc_R1', 'acc_R2', 'acc_R3', 'acc_R4',
-	'protocol_value', 'protocol_lose', 'protocol_uses_bulb', 'protocol_disagree', 'protocol_compile_fail']
+	'protocol_value', 'protocol_lose', 'protocol_announce', 'protocol_uses_bulb', 'protocol_parse_fail',
+	'protocol_kept']
 
 
 class ICLArena(LLMArena):
@@ -70,11 +73,21 @@ class ICLArena(LLMArena):
 
 	# ---------------- 比赛 ----------------
 
-	def run_episode(self, backends, protocol):
+	def run_episode(self, backends, protocol, active=None):
+		"""
+		active: 可选，[bs, nsteps] 的来访顺序（1-indexed）。评估协议时用它重放给定的对局，
+		           不传则随机生成（正常比赛）。
+		"""
 		opt = self.opt
 		game = self.game
 		n = opt.game_nagents
 		game.reset()
+		if active is not None:		# 重放：用给定的来访顺序替换随机生成，并据此重建"谁来过"
+			game.active_agent[:] = active
+			game.has_been.zero_()
+			for b in range(opt.bs):
+				for s in range(opt.nsteps):
+					game.has_been[b][s][game.active_agent[b][s] - 1] = 1
 		episode = self.create_episode()
 		episode.tell = torch.zeros(opt.bs).int()
 		episode.transcripts = [[] for _ in range(opt.bs)]	# (day, agent, 看到的bit, option)，和 LLMArena 一致
@@ -156,7 +169,7 @@ class ICLArena(LLMArena):
 			step = step + 1
 
 		episode.game_stats = game.get_stats(episode.steps)
-		episode.memories = [[P.render_memory(facts[b][k], notes[b][k], opt.icl_notes is not False) for k in range(n)]
+		episode.memories = [[P.render_memory(facts[b][k], notes[b][k], opt.icl_notes is not False, opt) for k in range(n)]
 			for b in range(opt.bs)]
 		episode.active_agent = game.active_agent.clone()
 		return episode
@@ -189,11 +202,12 @@ class ICLArena(LLMArena):
 			msgs = P.build_draft_messages(opt, transcript, context, draft, objections)
 			final = P.clean_markdown(self.ask(backends, 1, msgs, 'draft')) or draft
 
+		t = texts(opt)
 		self.ws.write('discussion.md', '\n\n'.join([
-			'# Discussion', P.render_transcript(transcript),
-			'# Draft protocol (prisoner 1)', draft,
-			'# Reviews', '\n'.join(f'- prisoner {k}: {text}' for k, text in reviews),
-			'# Final protocol', final if objections else '(same as the draft: everyone agreed)']), r)
+			t['dl_discussion'], P.render_transcript(transcript, opt),
+			t['dl_draft'], draft,
+			t['dl_reviews'], '\n'.join(t['suggestion_line'].format(k=k, text=text) for k, text in reviews),
+			t['dl_final'], final if objections else t['dl_same']]), r)
 		return final or '(no protocol was agreed)'
 
 	# ---------------- 协议检查 ----------------
@@ -240,34 +254,88 @@ class ICLArena(LLMArena):
 			f'parse fail {fails}/{len(raw)}')
 		return res, text
 
-	def checked_protocol(self, backends, protocol, r, planned, context=None):
+	def checked_protocol(self, backends, protocol, r, planned, context=None, previous=None):
 		"""
-		icl_check_protocol = "report"：只检查、记录；"revise"：没通过（完美执行的分数 < icl_check_min）就
-		把报告交给 1 号修改，最多 icl_check_retries 次，用分数最高的那一版。人写的协议（E1）只检查不修改
+		icl_check_protocol：
+			"report"：只评估、记录
+			"revise"：分数低于 icl_check_min 就把报告交给 1 号修改，最多 icl_check_retries 次，用分数最高的一版
+		人写的协议（E1）只评估、不修改。
+
+		previous = (上一轮的协议, 上一轮的评估结果)：E3 复盘后的新协议如果比上一版差，就保留上一版，
+		防止复盘让协议越改越差。保留时 res['kept'] = 1。
+		评估方式由 icl_check_method 决定："replay"（默认，用协议在固定的来访顺序上真的打一遍比赛）或 "compile"（旧的决策表）。
 		"""
 		mode = self.opt.icl_check_protocol
 		if not mode:
 			return protocol, None
-		res, text = self.check_protocol(backends, protocol, r)
-		best = (res['value'], protocol, res)
+		res, text = self.evaluate_protocol(backends, protocol, r)
+		best = (res['value'], protocol, res, text)
 		if mode == 'revise' and planned:
 			for i in range(self.opt.icl_check_retries if self.opt.icl_check_retries is not None else 2):
 				if best[0] >= self.check_min:
 					break
-				fixed = P.clean_markdown(self.ask(backends, 1, P.build_fix_messages(self.opt, protocol, text, context),
-					'fix')) or protocol
+				fixed = P.clean_markdown(self.ask(backends, 1, P.build_fix_messages(self.opt, best[1], best[3], context),
+					'fix')) or best[1]
 				self.ws.write(f'protocol_v{i + 1}.md', fixed, r)
-				res, text = self.check_protocol(backends, fixed, r, f'_v{i + 1}')
-				protocol = fixed
+				res, text = self.evaluate_protocol(backends, fixed, r, f'_v{i + 1}')
 				if res['value'] > best[0]:
-					best = (res['value'], fixed, res)
-		return best[1], best[2]
+					best = (res['value'], fixed, res, text)
+		protocol, res = best[1], dict(best[2], kept=0)
+		if previous is not None and self.opt.icl_keep_better is not False:
+			prev_protocol, prev_res = previous
+			if prev_res is not None and prev_res.get('value') is not None and prev_res['value'] > res['value']:
+				print(f'  新协议评估 {res["value"]:.2f} 不如上一版 {prev_res["value"]:.2f}，保留上一版协议')
+				self.ws.write('protocol_rejected.md', protocol, r)
+				protocol, res = prev_protocol, dict(prev_res, kept=1)
+		return protocol, res
+
+	def evaluate_protocol(self, backends, protocol, r, tag=''):
+		if (self.opt.icl_check_method or 'replay') == 'compile':
+			return self.check_protocol(backends, protocol, r, tag)
+		return self.replay_protocol(backends, protocol, r, tag)
+
+	def replay_protocol(self, backends, protocol, r, tag=''):
+		"""
+		基于比赛记录的评估：在固定的一组来访顺序（整次实验都一样）上用这份协议打一遍比赛。
+		agent 有完整的访问记录和自己的笔记，所以计数员这类带状态的协议能被正确评估。
+		评估用的比赛记录存在 round_xx/protocol_eval{tag}.jsonl，报告存在 protocol_eval{tag}.md
+		"""
+		opt = self.opt
+		bs = opt.icl_eval_bs or opt.bs
+		active = torch.as_tensor(PE.make_benchmark(opt.game_nagents, opt.nsteps, bs, opt.icl_eval_seed or 12345))
+		saved_bs, opt.bs = opt.bs, bs
+		state = np.random.get_state()		# 评估不应该消耗正式比赛的随机数（保证续跑可复现）
+		try:
+			self.game.opt.bs = bs
+			episode = self.run_episode(backends, protocol, active=active)
+		finally:
+			opt.bs = saved_bs
+			self.game.opt.bs = saved_bs
+			np.random.set_state(state)
+		m = self.episode_metrics(episode)
+		m['parse_fail'] = episode.parse_fail / max(1, len(episode.decisions))
+		r_vals = episode.r[:, 0].numpy()
+		ann = [d for d in episode.decisions if d['action'] == 'ANNOUNCE']
+		res = {
+			'value': m['avg_reward'], 'lose': float((r_vals < 0).mean()), 'win': float((r_vals > 0).mean()),
+			'announce': float(episode.tell.float().mean().item()),
+			'uses_bulb': int(any(d['action'] == 'ANNOUNCE' and d['bulb_seen'] == 'ON' for d in ann)
+				or any(d['action'] == 'ON' for d in episode.decisions)),
+			'parse_fail': m['parse_fail'],
+		}
+		text = PE.summarize(episode, m, protocol, opt.game_nagents)
+		self.ws.write(f'protocol_eval{tag}.md', text, r)
+		self.ws.write_jsonl(f'protocol_eval{tag}.jsonl', episode.decisions, r)
+		print(f'  协议评估{tag}（重放 {bs} 局）：归一化奖励 {res["value"]:.2f}，说错 {res["lose"]:.0%}，'
+			f'宣布 {res["announce"]:.0%}，解析失败 {res["parse_fail"]:.1%}')
+		return res, text
 
 	# ---------------- 赛后复盘 ----------------
 
 	def build_debrief(self, episode, m):
-		"""统计 + 几局失败对局的完整记录（上帝视角），给下一轮商定协议用"""
+		"""统计 + 几局失败对局的完整记录（上帝视角），给下一轮商定协议用；文字随 icl_lang"""
 		opt = self.opt
+		t = texts(opt)
 		god = episode.game_stats.god_reward
 		outcome = {}
 		for b in range(opt.bs):
@@ -275,11 +343,11 @@ class ICLArena(LLMArena):
 			outcome[b] = 'win' if r > 0 else 'lose' if r < 0 else 'missed' if god[b] > 0 else 'silent'
 		count = {k: sum(v == k for v in outcome.values()) for k in ('win', 'lose', 'missed', 'silent')}
 		lines = [
-			f"Results over {opt.bs} games: normalized reward {m['avg_reward']:.2f}.",
-			f"- correct announcement (win): {count['win']}",
-			f"- wrong announcement (lose): {count['lose']}",
-			f"- everyone had visited by day {opt.nsteps} but nobody announced: {count['missed']}",
-			f"- not everyone visited and nobody announced (nothing could be done): {count['silent']}",
+			t['db_results'].format(bs=opt.bs, r=m['avg_reward']),
+			t['db_win'].format(n=count['win']),
+			t['db_lose'].format(n=count['lose']),
+			t['db_missed'].format(T=opt.nsteps, n=count['missed']),
+			t['db_silent'].format(n=count['silent']),
 		]
 		k = opt.icl_debrief_games or 4
 		shown = ([b for b in range(opt.bs) if outcome[b] == 'lose'] +
@@ -291,23 +359,23 @@ class ICLArena(LLMArena):
 			by_game.setdefault(d['game'], []).append(d)
 		for b in shown:
 			visited = set()
-			lines += ['', f"## Game {b}: {self._outcome_text(b, outcome[b], episode)}"]
+			lines += ['', t['db_game'].format(b=b, outcome=self._outcome_text(b, outcome[b], episode))]
 			for d in by_game.get(b, []):
 				visited.add(d['agent'])
-				lines.append(f"- day {d['day']}: prisoner {d['agent']} entered (visited so far: "
-					f"{sorted(visited)}), saw the bulb {d['bulb_seen']}, chose {d['action']}. "
-					f"Notes: \"{d['notes'].strip()}\"")
+				lines.append(t['db_step'].format(day=d['day'], a=d['agent'], visited=sorted(visited),
+					bulb=bulb_word(opt, d['bulb_seen'] == 'ON'), action=d['action'], notes=d['notes'].strip()))
 		return '\n'.join(lines)
 
 	def _outcome_text(self, b, outcome, episode):
 		n = self.opt.game_nagents
+		t = texts(self.opt)
 		if outcome in ('win', 'lose'):
 			day, a, _, _ = episode.transcripts[b][-1]
 			seen = set(episode.active_agent[b][:day].tolist())
 			missing = sorted(set(range(1, n + 1)) - seen)
-			return (f"WIN: prisoner {a} announced correctly on day {day}" if outcome == 'win' else
-				f"LOSE: prisoner {a} announced on day {day}, but prisoner(s) {missing} had not visited yet")
-		return 'MISSED: everyone had visited, but nobody announced'
+			return (t['db_out_win'].format(a=a, day=day) if outcome == 'win' else
+				t['db_out_lose'].format(a=a, day=day, missing=missing))
+		return t['db_out_missed']
 
 	# ---------------- 主循环 ----------------
 
@@ -321,30 +389,31 @@ class ICLArena(LLMArena):
 			start, protocol, lessons, debrief = state['round'] + 1, state['protocol'], state['lessons'], state['debrief']
 			test_log, elapsed_before = state['test_log'], state['elapsed']
 			metrics_log, check = state.get('metrics', []), state.get('check', {})
+			check_res = state.get('check_res')
 			rng = state['rng']
 			np.random.set_state((rng['numpy'][0], np.array(rng['numpy'][1], dtype=np.uint32), *rng['numpy'][2:]))
 			random.setstate((rng['random'][0], tuple(rng['random'][1]), rng['random'][2]))
-			print(f'Resumed from {ws.run_dir}: round {state["round"]} done, elapsed {fmt_duration(elapsed_before)}')
+			print(f'从 {ws.run_dir} 续跑：第 {state["round"]} 轮已完成，已用时 {fmt_duration(elapsed_before)}')
 			if test_callback:		# main.py 以 'w' 打开结果 CSV，把之前的结果补写回去
 				for e, rew in test_log:
 					test_callback(e, rew)
 		else:
 			start, protocol, lessons, debrief, test_log, elapsed_before = 0, None, '', '', [], 0.0
-			metrics_log, check = [], {}
+			metrics_log, check, check_res = [], {}, None
 			if opt.icl_seed is not None:
 				np.random.seed(opt.icl_seed)
 				random.seed(opt.icl_seed)
 		log_file, writer = self.open_log(ws.run_dir, start)
 
 		session_start = time.time()
-		print(f'[{now()}] start: rounds {start}..{rounds - 1}, backend {opt.icl_backend}, run dir {ws.run_dir}')
+		print(f'[{now()}] 开始：第 {start}..{rounds - 1} 轮，后端 {opt.icl_backend}，结果目录 {ws.run_dir}')
 
 		def elapsed():
 			return elapsed_before + time.time() - session_start
 
 		for r in range(start, rounds):
-			# 1. 本轮的协议：E1 读文件；E2 第 0 轮商定；E3 每轮带着复盘重新商定。新协议先检查（icl_check_protocol）
-			context = None
+			# 1. 本轮的协议：E1 读文件；E2 第 0 轮商定；E3 每轮带着复盘重新商定。新协议先评估（icl_check_protocol）
+			context, previous = None, None
 			if protocol is None:
 				planned = not opt.icl_protocol_file
 				if planned:
@@ -355,12 +424,13 @@ class ICLArena(LLMArena):
 			elif opt.icl_reflect:
 				planned = True
 				context = {'protocol': protocol, 'debrief': debrief, 'lessons': lessons}
+				previous = (protocol, check_res)		# 新协议不能比上一版差，否则保留上一版
 				protocol = self.plan(backends, r, context)
 			else:
-				planned = None		# 沿用上一轮的协议和检查结果
+				planned = None		# 沿用上一轮的协议和评估结果
 			if planned is not None:
-				protocol, res = self.checked_protocol(backends, protocol, r, planned, context)
-				check = self.check_metrics(res)
+				protocol, check_res = self.checked_protocol(backends, protocol, r, planned, context, previous)
+				check = self.check_metrics(check_res)
 			ws.write('protocol.md', protocol, r)
 
 			# 2. 比赛
@@ -380,12 +450,12 @@ class ICLArena(LLMArena):
 			if test_callback:
 				test_callback(r, m['avg_reward'])
 			eta = (time.time() - session_start) / (r - start + 1) * (rounds - r - 1)
-			print(f'[{now()}] ROUND {r}:', self.episode_stats(m), f'+/- {m["reward_se"]:.3f} (s.e.)',
-				f'parse fail: {m["parse_fail"]:.3f} | elapsed {fmt_duration(elapsed())} ETA {fmt_duration(eta)}')
-			print(f'  announcements {m["announce_n"]} (win rate {m["announce_win_rate"]:.2f}, '
-				f'bulb ON {m["announce_bulb_on"]:.2f})' + (f', oracle agreement {m["oracle_acc"]:.2f} '
-				f'(R1 {m["acc_R1"]:.2f} R2 {m["acc_R2"]:.2f} R3 {m["acc_R3"]:.2f} R4 {m["acc_R4"]:.2f})'
-				if 'oracle_acc' in m else ''))
+			print(f'[{now()}] 第 {r} 轮：归一化奖励 {m["avg_reward"]:.3f} ± {m["reward_se"]:.3f}（标准误）'
+				f'| 赢 {m["win"]:.2f} 输 {m["lose"]:.2f} 宣布率 {m["tell_rate"]:.2f} 解析失败 {m["parse_fail"]:.3f} '
+				f'| 用时 {fmt_duration(elapsed())} 预计剩余 {fmt_duration(eta)}')
+			print(f'  宣布 {m["announce_n"]} 次（胜率 {m["announce_win_rate"]:.2f}，宣布时灯开着的比例 {m["announce_bulb_on"]:.2f}）'
+				+ (f'，和最优协议一致 {m["oracle_acc"]:.2f}（R1 {m["acc_R1"]:.2f} R2 {m["acc_R2"]:.2f} '
+				f'R3 {m["acc_R3"]:.2f} R4 {m["acc_R4"]:.2f}）' if 'oracle_acc' in m else ''))
 			if verbose:
 				self.describe_episode(episode)
 
@@ -402,22 +472,23 @@ class ICLArena(LLMArena):
 			if opt.icl_reflect and r < rounds - 1:
 				new = P.clean_markdown(self.ask(backends, 1,
 					P.build_lessons_messages(opt, protocol, debrief, lessons), 'lessons'))
-				lessons = (lessons + f'\n\n## After round {r}\n' + new).strip()
+				lessons = (lessons + '\n\n' + texts(opt)['lessons_after'].format(r=r) + '\n' + new).strip()
 				ws.write('lessons.md', lessons)
 
 			# 5. 保存状态，被打断后从下一轮接着跑
 			np_state = np.random.get_state()
 			ws.save_state({
 				'round': r, 'protocol': protocol, 'lessons': lessons, 'debrief': debrief,
-				'test_log': test_log, 'metrics': metrics_log, 'check': check, 'elapsed': elapsed(),
+				'test_log': test_log, 'metrics': metrics_log, 'check': check, 'check_res': check_res, 'elapsed': elapsed(),
 				'rng': {'numpy': [np_state[0], np_state[1].tolist(), *np_state[2:]], 'random': random.getstate()},
 			})
 
 		log_file.close()
-		print(f'[{now()}] finished, total time {fmt_duration(elapsed())}')
+		print(f'[{now()}] 完成，总用时 {fmt_duration(elapsed())}')
 		rewards = [rew for _, rew in test_log]
 		if rewards:
-			print('MEAN TEST REWARD over', len(rewards), 'rounds:', sum(rewards) / len(rewards))
+			print(f'{len(rewards)} 轮的平均归一化奖励：{sum(rewards) / len(rewards):.3f}')
+			print('MEAN TEST REWARD over', len(rewards), 'rounds:', sum(rewards) / len(rewards))	# 给 run_batch 等脚本解析用
 		try:
 			from icl.plot_icl import plot_icl
 			print('curves saved to', plot_icl(ws.run_dir, nagents=opt.game_nagents, nsteps=opt.nsteps))
@@ -431,8 +502,12 @@ class ICLArena(LLMArena):
 	def check_metrics(res):
 		if res is None:
 			return {}
-		return {'protocol_value': res['value'], 'protocol_lose': res['lose'], 'protocol_uses_bulb': int(res['uses_bulb']),
-			'protocol_disagree': res['disagree'], 'protocol_compile_fail': res['compile_fail']}
+		if 'disagree' in res:		# 旧的编译式检查
+			return {'protocol_value': res['value'], 'protocol_lose': res['lose'],
+				'protocol_uses_bulb': int(res['uses_bulb']), 'protocol_parse_fail': res.get('compile_fail', '')}
+		return {'protocol_value': res['value'], 'protocol_lose': res['lose'], 'protocol_announce': res['announce'],
+			'protocol_uses_bulb': res['uses_bulb'], 'protocol_parse_fail': res['parse_fail'],
+			'protocol_kept': res.get('kept', 0)}
 
 	@staticmethod
 	def reward_se(episode, n_boot=1000):

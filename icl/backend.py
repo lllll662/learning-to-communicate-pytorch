@@ -23,18 +23,25 @@ from llm.prompt_builder import OPTION_OFF, OPTION_ON, OPTION_TELL
 from icl.prompts import ACTIONS
 
 ORACLE_PROTOCOL = os.path.join(os.path.dirname(__file__), 'protocols', 'switch_3_oracle.md')
+ORACLE_PROTOCOL_ZH = os.path.join(os.path.dirname(__file__), 'protocols', 'switch_3_oracle_zh.md')
 
 
-def read_api_key(env_name):
+def _endpoint(url):
+	"""允许只写站点或 /v1、/beta 路径，自动补成 .../chat/completions"""
+	url = url.rstrip('/')
+	return url if url.endswith('/chat/completions') else url + '/chat/completions'
+
+
+def read_api_key(env_name, file_name='.deepseek_key'):
 	"""
 	按顺序找 API key：环境变量 → 仓库根目录的 .deepseek_key（已在 .gitignore 里） → ~/.deepseek_key。
 	key 不放进配置文件，避免被提交。文件编码自动识别：PowerShell 的 `echo key > 文件` 默认写 UTF-16（带 BOM），
-	Linux / Git Bash 写 UTF-8，两种都能读。
+	Linux / Git Bash 写 UTF-8，两种都能读。换中转商后可以把同一个文件换成中转商的 key。
 	"""
 	key = os.environ.get(env_name)
 	if key:
 		return key.strip()
-	for path in (os.path.join(os.getcwd(), '.deepseek_key'), os.path.expanduser('~/.deepseek_key')):
+	for path in (os.path.join(os.getcwd(), file_name), os.path.expanduser('~/' + file_name)):
 		if os.path.exists(path):
 			key = _read_text_any_encoding(path).strip()
 			if key:
@@ -92,19 +99,26 @@ class VLLMBackend:
 
 class DeepSeekBackend:
 	"""
-	DeepSeek 在线 API。API key 只从环境变量 DEEPSEEK_API_KEY 读，不写进配置文件，避免被提交。
-	用 /beta 端点：支持 Chat Prefix Completion（最后一条 assistant 消息加 "prefix": true），
-	所以和其他后端一样可以预填回复开头。不支持时（接口返回 400）自动退回"要求回复以某段文字开头"。
+	DeepSeek 在线 API，也适用于任何 OpenAI 兼容的中转服务。API key 只从环境变量或 .deepseek_key 读，不写进配置。
+
+	spec 里可以填（都有默认值）：
+		url      请求地址。可以写完整的 .../chat/completions，也可以只写 .../v1 或 .../beta（会自动补 /chat/completions）
+		model    模型名，中转商可能和官方不同（用 icl.check_api 查）
+		prefix   是否用"预填回复开头"（assistant 消息加 "prefix": true，只有官方 /beta 端点支持）。
+		         中转商一般不支持，设成 false 更稳；不填时先试，遇到 400 自动退回"要求回复以某段文字开头"。
+		key_env  key 所在环境变量名，默认 DEEPSEEK_API_KEY；也可以把 key 写进 .deepseek_key 文件。
+	官方端点默认 https://api.deepseek.com/beta/chat/completions；用中转商时在配置的 icl_agents 里写 url。
 	"""
 	DEFAULT_URL = 'https://api.deepseek.com/beta/chat/completions'
 	KEY_ENV = 'DEEPSEEK_API_KEY'
 
 	def __init__(self, spec, opt):
-		self.url = (spec.get('url') or self.DEFAULT_URL).rstrip('/')
+		self.url = _endpoint(spec.get('url') or self.DEFAULT_URL)
 		self.model = spec.get('model') or 'deepseek-chat'
-		self.api_key = read_api_key(self.KEY_ENV)
+		self.key_env = spec.get('key_env') or self.KEY_ENV
+		self.api_key = read_api_key(self.key_env)
 		self.extra = opt.icl_request_extra or {}
-		self.prefix_supported = True		# 第一次遇到 400 后改成用指令代替预填
+		self.prefix_supported = spec.get('prefix', True)		# false：完全不发 prefix，省一次 400
 		self.pool = ThreadPoolExecutor(max_workers=opt.icl_concurrency or 4)	# 在线 API 并发别太高，容易 429
 		self.timeout = opt.icl_timeout or 300
 
@@ -200,7 +214,8 @@ class HFBackend:
 class RuleBackend:
 	"""按 oracle 协议作答的假 LLM：输出格式和真模型一样，走同样的解析流程"""
 	def __init__(self, opt):
-		with open(ORACLE_PROTOCOL, encoding='utf-8') as f:
+		path = ORACLE_PROTOCOL_ZH if opt.icl_lang == 'zh' else ORACLE_PROTOCOL
+		with open(path, encoding='utf-8') as f:
 			self.protocol = f.read()
 
 	def chat(self, requests, temperature, max_tokens):

@@ -9,10 +9,12 @@
    "icl_backend": "deepseek",
    "icl_agents": [
       {
-         "model": "deepseek-chat"
+         "url": "https://api.ofox.io/v1",
+         "model": "deepseek/deepseek-v4.1-flash-1017",
+         "prefix": false
       }
    ],
-   "icl_protocol_file": "icl/protocols/switch_3_oracle.md",
+   "icl_protocol_file": "icl/protocols/switch_3_oracle_zh.md",
    "icl_decision_format": "conditions",
    "icl_prefill": true,
    "icl_notes": true,
@@ -25,8 +27,12 @@
    "icl_check_protocol": "report",
    "icl_rounds": 4,
    "icl_reflect": false,
-   "icl_run_dir": "results/deepseek_given",
+   "icl_run_dir": "results/deepseek_given_zh",
    "icl_seed": 0,
    "bs": 32,
-   "cuda": 0
+   "cuda": 0,
+   "icl_lang": "zh",
+   "icl_check_method": "replay",
+   "icl_eval_bs": 64,
+   "icl_eval_seed": 12345
 }
